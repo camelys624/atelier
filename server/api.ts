@@ -43,7 +43,7 @@ function checkOrigin(request: Request) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.headers.has('authorization')) return
   const origin = request.headers.get('origin')
   const allowed = new Set([new URL(request.url).origin, baseUrl()])
-  if (process.env.NODE_ENV !== 'production') { allowed.add('http://127.0.0.1:5173'); allowed.add('http://localhost:5173') }
+  if (process.env.NODE_ENV !== 'production') { const port = process.env.DEV_WEB_PORT || '5173'; allowed.add(`http://127.0.0.1:${port}`); allowed.add(`http://localhost:${port}`) }
   if (origin && !allowed.has(origin)) throw new HttpError(403, '请求来源不被允许')
 }
 async function serialize(task: Task) {
@@ -128,8 +128,9 @@ export async function handleApi(request: Request): Promise<Response> {
       const allAccounts = accounts(), allTasks = db.query<Task, []>('SELECT * FROM tasks ORDER BY created DESC LIMIT 100').all()
       const keys = db.query('SELECT id,name,prefix,enabled,created,last_used FROM api_keys ORDER BY created DESC').all()
       const counts = db.query<{ status: string; count: number }, []>('SELECT status,COUNT(*) AS count FROM images GROUP BY status').all()
-      const hourly = db.query('SELECT CAST(created/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM tasks WHERE created>? GROUP BY hour ORDER BY hour').all(Date.now() - 24 * 3600_000)
-      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), hourly, serverTime: Date.now(), baseUrl: baseUrl() })
+      const delivered = db.query<{ status: string; count: number }, []>("SELECT images.status,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status IN ('success','error') GROUP BY images.status").all()
+      const hourly = db.query("SELECT CAST(images.finished/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status='success' AND images.finished>? GROUP BY hour ORDER BY hour").all(Date.now() - 24 * 3600_000)
+      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, serverTime: Date.now(), baseUrl: baseUrl() })
     }
     if (path === '/api/accounts' && request.method === 'POST') {
       const input = await body(request)

@@ -61,7 +61,8 @@ export function claimImage(): { image: ImageRow; task: Task; account: Account | 
       let account: Account | null = null
       if (!task.demo) {
         const source = accountSource(task.model)
-        account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
+        // Least-loaded first (inflight relative to slots), then least recently used, so work spreads before any account stacks up.
+        account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY CAST(inflight AS REAL)/slots,inflight,last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
         if (!account) continue
         db.run('UPDATE accounts SET inflight=inflight+1,last_used=? WHERE id=?', [Date.now(), account.id])
       }

@@ -1,3 +1,4 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { Console } from '@/components/console'
-export const Route = createFileRoute('/')({ component: () => <Console view="overview" /> })
+import { validateTaskSearch } from '@/lib/search'
+export const Route = createFileRoute('/')({ validateSearch: validateTaskSearch, component: () => <Console view="overview" /> })
