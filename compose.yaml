@@ -1,0 +1,27 @@
+services:
+  atelier:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3080:3080"
+    environment:
+      ADMIN_KEY: ${ADMIN_KEY:?Run bun run setup or set ADMIN_KEY}
+      MASTER_KEY: ${MASTER_KEY:?Run bun run setup or set MASTER_KEY}
+      BASE_URL: ${BASE_URL:-http://127.0.0.1:3080}
+      HOST: 0.0.0.0
+      PORT: 3080
+      PYTHON_BIN: python3
+      DATA_DIR: /app/data
+      CODEX_OAUTH_CLIENT_ID: ${CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}
+      CODEX_RESPONSES_MODEL: ${CODEX_RESPONSES_MODEL:-gpt-6.1-sol}
+    volumes:
+      - atelier_data:/app/data
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  atelier_data:
