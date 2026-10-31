@@ -55,12 +55,15 @@ def release_account(value):
             entry[1] -= 1
             if entry[1] <= 0: del _accounts[value]
 
+_default_timeout = int(payload.get('timeout', 600))
+
 class RuntimeConfig:
     default_upstream_model_name = 'auto'
     default_thinking_effort = 'auto'
     global_system_prompt = ''
-    # Process-wide: every request carries the same jobTimeoutSeconds setting.
-    image_poll_timeout_secs = int(payload.get('timeout', 600))
+    # Each request carries its own timeout; the setting can change while earlier requests are still running.
+    @property
+    def image_poll_timeout_secs(self): return getattr(_local, 'timeout', None) or _default_timeout
     image_poll_initial_wait_secs = 3
     image_poll_interval_secs = 5
     image_settle_enabled = False
@@ -133,7 +136,7 @@ def execute(request=None):
         from services.protocol import conversation
         return {'ok': True, 'protocol': 'chatgpt2api', 'commit': '92dd80e'}
     _local.account = values
-    config.image_poll_timeout_secs = int(request.get('timeout', config.image_poll_timeout_secs))
+    _local.timeout = int(request['timeout']) if request.get('timeout') else None
     refreshed_account(values)
     current = register_account(values)
     if not WORKER: token = current
@@ -155,28 +158,30 @@ def execute(request=None):
             return {'info': info, 'credentials': credential_values(values)}
         from services.protocol import conversation
         conversation.format_image_result = format_result
+        codex = values.get('source_type') == 'codex'
         image_request = conversation.ConversationRequest(
             prompt=request['prompt'], model=request['model'], n=1,
             images=request.get('images') or [], size=request.get('size') or '1024x1024',
             quality=request.get('quality') or 'auto', response_format='b64_json', message_as_error=True,
         )
-        source = conversation.stream_codex_image_outputs if values.get('source_type') == 'codex' else conversation.stream_image_outputs
-        for result in source(backend, image_request):
-            if result.kind == 'message': raise RuntimeError('上游未生成图片：' + str(result.text or '')[:200])
-            if result.kind != 'result': continue
-            for item in result.data:
-                if not item.get('b64_json'): continue
-                raw = base64.b64decode(item['b64_json'], validate=True)
-                target = Path(request['output'])
-                temp = target.with_suffix('.part')
-                temp.write_bytes(raw)
-                temp.replace(target)
-                return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png', 'credentials': credential_values(values)}
+        source = conversation.stream_codex_image_outputs if codex else conversation.stream_image_outputs
+        with contextlib.closing(source(backend, image_request)) as results:
+            for result in results:
+                if result.kind == 'message': raise RuntimeError('上游未生成图片：' + str(result.text or '')[:200])
+                if result.kind != 'result': continue
+                for item in result.data:
+                    if not item.get('b64_json'): continue
+                    raw = base64.b64decode(item['b64_json'], validate=True)
+                    target = Path(request['output'])
+                    temp = target.with_suffix('.part')
+                    temp.write_bytes(raw)
+                    temp.replace(target)
+                    return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png', 'credentials': credential_values(values)}
         raise RuntimeError('上游未返回图片结果')
     finally:
         backend.close()
         release_account(current)
-        _local.account = None
+        _local.account = _local.timeout = None
 
 def handle(request):
     values = request.get('account') or {}
@@ -192,17 +197,20 @@ def handle(request):
 
 def serve(lines, output):
     lock, threads = threading.Lock(), []
-    def run(line):
-        try: message = json.loads(line)
+    def run(box):
+        try: message = json.loads(box.pop())
         except ValueError: return
-        result = handle(message.get('payload') or {})
+        result = handle(message.pop('payload', None) or {})
         text = json.dumps({'id': message.get('id'), **result}, ensure_ascii=False)
         with lock:
             output.write(text + '\n')
             output.flush()
     for line in lines:
         if not line.strip(): continue
-        thread = threading.Thread(target=run, args=(line,), daemon=True)
+        # Hand the raw line over in a box the thread empties, and drop our reference before blocking on
+        # the next read, so an idle worker does not keep the previous request (and its images) alive.
+        thread = threading.Thread(target=run, args=([line],), daemon=True)
+        del line
         thread.start()
         threads.append(thread)
         threads = [item for item in threads if item.is_alive()]

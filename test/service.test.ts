@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import OSS from 'ali-oss'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -13,12 +13,13 @@ process.env.MASTER_KEY = '11'.repeat(32)
 const store = await import('../server/store')
 const { handleApi } = await import('../server/api')
 const scheduler = await import('../server/scheduler')
-const { validateImageUrl } = await import('../server/network')
+const { validateImageUrl, fetchReference } = await import('../server/network')
+const { withImageTransfer } = await import('../server/image-transfers')
 const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/device-auth')
 const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
 const { MAX_UPLOAD_BYTES, referencePath, uploadedReference } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
-const { bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
+const { AdapterTimeoutError, bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
 const { needsAccountRefresh } = await import('../server/account-policy')
 const { db, defaults, seal, unseal, getTask, taskImages, saveSettings } = store
 const admin = { Authorization: `Bearer ${process.env.ADMIN_KEY}` }
@@ -72,11 +73,12 @@ describe('image edit SDK compatibility', () => {
       expect(saved.model).toBe('gpt-image-2.5-sunburst'); expect(saved.size).toBe('1536x1024'); expect(saved.quality).toBe('high')
       const payload = await Bun.file(capture).json()
       expect(payload.model).toBe(saved.model); expect(payload.size).toBe(saved.size); expect(payload.quality).toBe(saved.quality)
-      expect(payload.images).toEqual(await Promise.all(refs.map(async file => `data:image/png;base64,${Buffer.from(await file.arrayBuffer()).toString('base64')}`)))
+      // References reach the adapter as file paths, in order, so large images never cross the IPC pipe.
       const references = JSON.parse(saved.refs)
       expect(references).toHaveLength(3)
-      expect(await uploadedReference(references[0])).toBe(payload.images[0])
-      expect(await Bun.file(referencePath(references[0])).exists()).toBe(true)
+      expect(payload.images).toEqual(references.map(referencePath))
+      for (const [index, file] of refs.entries()) expect(Buffer.from(await Bun.file(payload.images[index]).arrayBuffer())).toEqual(Buffer.from(await file.arrayBuffer()))
+      expect(await uploadedReference(references[0])).toBe(`data:image/png;base64,${png.toString('base64')}`)
       const repeated = await edit(form({}, refs), { ...admin, 'Idempotency-Key': 'sdk-edit' })
       expect(repeated.status).toBe(200); expect((await repeated.json()).task_id).toBe(saved.id)
       expect((await edit(form({ quality: 'medium' }, refs), { ...admin, 'Idempotency-Key': 'sdk-edit' })).status).toBe(400)
@@ -482,10 +484,65 @@ describe('durable queue and resource reservations', () => {
     await expect(validateImageUrl('https://127.0.0.1/image.png')).rejects.toThrow('私有网络')
   })
 })
+describe('bounded image transfers', () => {
+  test('writes reference chunks to disk before the response ends', async () => {
+    saveSettings({ ...defaults, allowedImageHosts: ['8.8.8.8'] })
+    const path = join(temporary, 'streamed-reference.png')
+    let controller!: ReadableStreamDefaultController<Uint8Array>, closed = false
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; controller.enqueue(new Uint8Array([1, 2, 3])) } })
+    const fetch = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(stream, { headers: { 'Content-Type': 'image/png' } }))
+    const downloading = fetchReference('https://8.8.8.8/image.png', path)
+    try {
+      await waitFor(() => existsSync(path) && statSync(path).size === 3)
+      expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3])
+      controller.enqueue(new Uint8Array([4, 5])); controller.close(); closed = true
+      await downloading
+      expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3, 4, 5])
+      expect(fetch.mock.calls[0][1]?.redirect).toBe('error')
+    } finally {
+      if (!closed) controller.close()
+      await downloading.catch(() => {})
+      fetch.mockRestore()
+    }
+  })
+  test('removes partial references on oversized or broken responses and cancels rejected bodies', async () => {
+    saveSettings({ ...defaults, allowedImageHosts: ['8.8.8.8'] })
+    let rejectedCancelled = false
+    const cases = [
+      { name: 'oversized', body: () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array(10 * 1024 * 1024)); c.enqueue(new Uint8Array([1])); c.close() } }), type: 'image/png', error: '10 MB' },
+      { name: 'broken', body: () => new ReadableStream({ async pull(c) { c.enqueue(new Uint8Array([1])); await Bun.sleep(10); c.error(new Error('connection closed')) } }), type: 'image/png', error: 'connection closed' },
+      { name: 'empty', body: () => new ReadableStream({ start(c) { c.close() } }), type: 'image/png', error: '内容为空' },
+      { name: 'unsupported', body: () => new ReadableStream({ cancel() { rejectedCancelled = true } }), type: 'text/plain', error: 'PNG' },
+    ]
+    for (const item of cases) {
+      const path = join(temporary, `${item.name}-reference.png`), body = item.body()
+      const fetch = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(body, { headers: { 'Content-Type': item.type } }))
+      try {
+        await expect(fetchReference('https://8.8.8.8/image.png', path)).rejects.toThrow(item.error)
+        expect(await Bun.file(path).exists()).toBe(false)
+      } finally { fetch.mockRestore() }
+    }
+    expect(rejectedCancelled).toBe(true)
+  })
+  test('shares transfer permits fairly and releases them after failures', async () => {
+    let active = 0, peak = 0
+    const started: number[] = []
+    const result = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => withImageTransfer(async () => {
+      active++; peak = Math.max(peak, active); started.push(index)
+      try { await Bun.sleep(10); if (index % 3 === 0) throw new Error('transfer failed'); return index }
+      finally { active-- }
+    })))
+    expect(started).toEqual(Array.from({ length: 20 }, (_, index) => index))
+    expect(peak).toBeLessThanOrEqual(Math.max(1, Math.min(32, Number.parseInt(process.env.IMAGE_TRANSFER_CONCURRENCY || '', 10) || 4)))
+    expect(active).toBe(0)
+    expect(result.filter(item => item.status === 'rejected')).toHaveLength(7)
+    expect(await withImageTransfer(async () => 'recovered')).toBe('recovered')
+  })
+})
 describe('adapter worker pool', () => {
   const fake = join(temporary, 'fake-pool-adapter')
   async function withAdapter(handler: string, env: Record<string, string>, run: () => Promise<void>) {
-    const saved = Object.fromEntries(['PYTHON_BIN', 'ADAPTER_WORKERS', 'ADAPTER_POOL'].map(key => [key, process.env[key]]))
+    const saved = Object.fromEntries(['PYTHON_BIN', 'ADAPTER_WORKERS', 'ADAPTER_POOL', 'ADAPTER_TIMEOUT_GRACE_MS'].map(key => [key, process.env[key]]))
     fakeAdapter(fake, handler)
     Object.assign(process.env, { PYTHON_BIN: fake, ...env })
     try { await run() } finally {
@@ -493,7 +550,7 @@ describe('adapter worker pool', () => {
       for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value
     }
   }
-  const echo = 'await Bun.sleep(p.delay || 0); if (p.crash) process.exit(1); return { ok: true, echo: p.echo, pid: process.pid }'
+  const echo = 'await Bun.sleep(p.delay || 0); if (p.crash) process.exit(1); if (p.output) await Bun.write(p.output, "late"); return { ok: true, echo: p.echo, pid: process.pid, credentials: p.credentials }'
   test('runs concurrent requests in one long-lived worker and matches results by id', () => withAdapter(echo, { ADAPTER_WORKERS: '1' }, async () => {
     const results = await Promise.all([['a', 150], ['b', 20], ['c', 80]].map(([value, delay]) => bridge({ echo: value, delay }, 60)))
     expect(results.map(r => r.echo)).toEqual(['a', 'b', 'c'])
@@ -511,6 +568,50 @@ describe('adapter worker pool', () => {
     expect(errors.every(message => message.includes('进程已退出'))).toBe(true)
     expect((await bridge({}, 60)).pid).not.toBe(first.pid)
   }))
+  test('keeps tracking a timed-out request until its worker finishes it, and keeps rotated credentials', () => withAdapter(echo, { ADAPTER_WORKERS: '1', ADAPTER_TIMEOUT_GRACE_MS: '150' }, async () => {
+    account('late-token')
+    const other = bridge({ delay: 1200 }, 60)
+    const error = await bridge({ delay: 600, accountId: 'late-token', credentials: { refresh_token: 'rotated-late' } }, 0).catch(e => e)
+    expect(error).toBeInstanceOf(AdapterTimeoutError)
+    let settled = false
+    void error.settled.then(() => { settled = true })
+    await Bun.sleep(100)
+    expect(settled).toBe(false)
+    await error.settled
+    expect(unseal(store.getAccount('late-token')!.secret).refresh_token).toBe('rotated-late')
+    await other
+  }))
+  test('stops a worker that only holds timed-out requests', () => withAdapter(echo, { ADAPTER_WORKERS: '1', ADAPTER_TIMEOUT_GRACE_MS: '100' }, async () => {
+    const output = join(temporary, 'never-written.png'), started = Date.now()
+    const error = await bridge({ delay: 3000, output }, 0).catch(e => e)
+    await error.settled
+    expect(Date.now() - started).toBeLessThan(2000)
+    await Bun.sleep(100)
+    expect(await Bun.file(output).exists()).toBe(false)
+    expect(adapterStats().workers).toHaveLength(0)
+  }))
+  test('holds the account slot and blocks retry until a timed-out attempt ends; the late attempt cannot overwrite the retry', () => withAdapter(
+    'const late = String(p.output).endsWith(".1.png"); await Bun.sleep(p.delay ?? (late ? 700 : 0)); if (p.output) await Bun.write(p.output, late ? "late" : "fresh"); return { ok: true, mime: "image/png", bytes: 5 }',
+    { ADAPTER_WORKERS: '1', ADAPTER_TIMEOUT_GRACE_MS: '150' }, async () => {
+      saveSettings({ ...defaults, jobTimeoutSeconds: 0 })
+      account('slot', 10, 1)
+      const keepAlive = bridge({ delay: 1500 }, 60)  // another request keeps the worker, and the timed-out thread, alive
+      const submitted = task('admin', 1), [image] = taskImages(submitted.id)
+      void scheduler.pump()
+      await waitFor(() => taskImages(submitted.id)[0].status === 'error')
+      expect(store.getAccount('slot')!.inflight).toBe(1)
+      expect(() => scheduler.retryTask(submitted.id)).toThrow('仍在结束中')
+      await waitFor(() => store.getAccount('slot')!.inflight === 0)
+      await Bun.sleep(50)
+      expect(await Bun.file(join(store.dataDir, 'spool', `${image.id}.1.png`)).exists()).toBe(false)
+      db.run("UPDATE accounts SET cooldown_until=0 WHERE id='slot'")  // skip the one-minute failure cooldown
+      scheduler.retryTask(submitted.id)
+      await waitFor(() => taskImages(submitted.id)[0].status === 'success')
+      const done = taskImages(submitted.id)[0]
+      expect(done.local_path!.endsWith(`${image.id}.2.png`)).toBe(true)
+      expect(await Bun.file(done.local_path!).text()).toBe('fresh')
+      await keepAlive
+    }))
   test('ADAPTER_POOL=0 starts one process per request', () => withAdapter(echo, { ADAPTER_POOL: '0' }, async () => {
     const [a, b] = await Promise.all([bridge({ delay: 50 }, 60), bridge({ delay: 50 }, 60)])
     expect(a.pid).not.toBe(b.pid)

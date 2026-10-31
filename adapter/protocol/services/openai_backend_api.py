@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import time
+import tempfile
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, ffi, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -25,6 +26,7 @@ from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uu
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
+from utils.image_transfer import codex_request_body, image_processing_slots
 
 
 class InvalidAccessTokenError(RuntimeError):
@@ -684,6 +686,7 @@ class OpenAIBackendAPI:
             headers: Any,
             payload: Dict[str, Any],
             body: Any,
+            image_count: int = 0,
     ) -> None:
         request_headers = self._codex_responses_headers()
         safe_request_headers = {
@@ -701,7 +704,7 @@ class OpenAIBackendAPI:
                 "tool_action": tool.get("action"),
                 "size": tool.get("size"),
                 "quality": tool.get("quality"),
-                "image_input_count": max(len((payload.get("input") or [{}])[0].get("content") or []) - 1, 0),
+                "image_input_count": image_count,
                 "prompt_preview": self._codex_body_preview(
                     (((payload.get("input") or [{}])[0].get("content") or [{}])[0].get("text") or ""),
                     500,
@@ -717,60 +720,49 @@ class OpenAIBackendAPI:
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
-        status_code = getattr(raw, "status", None)
         parse_errors: list[str] = []
-        events: list[Dict[str, Any]] = []
-        if "application/json" in content_type:
-            try:
-                data = json.loads(text)
-                if isinstance(data, dict):
-                    events.append(data)
-            except Exception as exc:
-                parse_errors.append(str(exc))
-        else:
-            lines: list[str] = []
-            for line in text.splitlines() + [""]:
-                if not line:
-                    if lines:
-                        payload_text = "\n".join(lines).strip()
-                        if payload_text and payload_text != "[DONE]":
-                            try:
-                                data = json.loads(payload_text)
-                            except Exception as exc:
-                                parse_errors.append(str(exc))
-                                data = None
-                            if isinstance(data, dict):
-                                events.append(data)
-                        lines = []
-                elif line.startswith("data:"):
-                    lines.append(line[5:].lstrip())
-
         event_types: Dict[str, int] = {}
         image_result_lengths: list[int] = []
-        for event in events:
-            event_type = str(event.get("type") or "<missing>")
-            event_types[event_type] = event_types.get(event_type, 0) + 1
-            image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
-        logger.info({
-            "event": "codex_responses_response_debug",
-            "status_code": status_code,
-            "content_type": content_type,
-            "response_text_len": len(text),
-            "event_count": len(events),
-            "event_types": event_types,
-            "image_result_lengths": image_result_lengths[:10],
-            "parse_error_count": len(parse_errors),
-            "parse_errors": parse_errors[:5],
-            "event_summaries": [OpenAIBackendAPI._codex_event_summary(event) for event in events[:30]],
-            "event_previews": [
-                OpenAIBackendAPI._codex_body_preview(event, 1500)
-                for event in events[:10]
-            ] if not image_result_lengths else [],
-            "body_preview": text[:1000] if not events else "",
-        })
-        for event in events:
-            yield event
+        summaries: list[dict] = []
+        event_count = 0
+
+        def payloads():
+            if 'application/json' in content_type:
+                yield raw.read().decode('utf-8', 'replace')
+                return
+            lines: list[str] = []
+            for encoded in raw:
+                line = encoded.decode('utf-8', 'replace').rstrip('\r\n')
+                if not line:
+                    if lines:
+                        yield '\n'.join(lines).strip()
+                        lines.clear()
+                elif line.startswith('data:'):
+                    lines.append(line[5:].lstrip())
+            if lines: yield '\n'.join(lines).strip()
+
+        try:
+            for text in payloads():
+                if not text or text == '[DONE]': continue
+                try: event = json.loads(text)
+                except ValueError as exc:
+                    if len(parse_errors) < 5: parse_errors.append(str(exc))
+                    continue
+                if not isinstance(event, dict): continue
+                event_count += 1
+                event_type = str(event.get('type') or '<missing>')
+                event_types[event_type] = event_types.get(event_type, 0) + 1
+                if len(image_result_lengths) < 10:
+                    image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
+                if len(summaries) < 30: summaries.append(OpenAIBackendAPI._codex_event_summary(event))
+                yield event
+        finally:
+            logger.info({
+                'event': 'codex_responses_response_debug', 'status_code': getattr(raw, 'status', None),
+                'content_type': content_type, 'event_count': event_count, 'event_types': event_types,
+                'image_result_lengths': image_result_lengths[:10], 'parse_errors': parse_errors,
+                'event_summaries': summaries,
+            })
 
     def iter_codex_image_response_events(
             self,
@@ -788,7 +780,8 @@ class OpenAIBackendAPI:
             "model": os.environ.get("CODEX_RESPONSES_MODEL", "").strip() or CODEX_RESPONSES_MODEL,
             "instructions": CODEX_RESPONSES_INSTRUCTIONS,
             "store": False,
-            "input": self._codex_image_input(prompt, images or []),
+            # Only the small metadata stays in memory; references are encoded into a file below.
+            "input": self._codex_image_input(prompt, []),
             "tools": [{
                 "type": "image_generation",
                 "model": model,
@@ -830,7 +823,7 @@ class OpenAIBackendAPI:
                 "quality": tool.get("quality"),
                 "output_format": tool.get("output_format"),
                 "stream": payload.get("stream"),
-                "image_input_count": max(len((payload.get("input") or [{}])[0].get("content") or []) - 1, 0),
+                "image_input_count": len(images or []),
                 "prompt_preview": self._codex_body_preview(
                     (((payload.get("input") or [{}])[0].get("content") or [{}])[0].get("text") or ""),
                     500,
@@ -841,30 +834,34 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
-        # Reuse the TLS/proxy-configured client used by the rest of this adapter.
-        # curl_cffi checks transfer completeness and decodes compressed HTTP bodies.
-        response = self.session.post(
-            self.base_url + path,
-            json=payload,
-            headers=self._codex_responses_headers(),
-            timeout=1200,
-            allow_redirects=False,
-        )
-        try:
-            if not 200 <= response.status_code < 300:
-                body: Any = response.text
-                try:
-                    body = response.json()
-                except Exception:
-                    pass
-                self._log_codex_response_failure(path, response.status_code, response.headers, payload, body)
-                ensure_ok(response, path)
-            with BytesIO(response.content) as raw:
+        # Keep the TLS/proxy-configured client. Native callbacks avoid curl_cffi's unbounded streaming queue,
+        # and a streamed POST avoids retaining every reference's base64/JSON body while waiting upstream.
+        with codex_request_body(payload, images or []) as (body, size), tempfile.TemporaryFile() as raw:
+            previous = self.session.curl_options
+            self.session.curl_options = {**previous, CurlOpt.POSTFIELDS: ffi.NULL,
+                                        CurlOpt.POSTFIELDSIZE_LARGE: size, CurlOpt.READFUNCTION: body.read}
+            try:
+                response = self.session.post(self.base_url + path, headers=self._codex_responses_headers(),
+                                             timeout=1200, allow_redirects=False, content_callback=raw.write)
+            finally:
+                self.session.curl_options = previous
+            try:
+                raw.seek(0)
+                if not 200 <= response.status_code < 300:
+                    # Bound error bodies too, while preserving status and upstream error codes.
+                    response.content = raw.read(64 * 1024)
+                    error_body: Any = response.text
+                    try: error_body = response.json()
+                    except ValueError: pass
+                    self._log_codex_response_failure(path, response.status_code, response.headers, payload, error_body, len(images or []))
+                    ensure_ok(response, path)
                 raw.headers = response.headers
                 raw.status = response.status_code
-                yield from self._iter_codex_response_events(raw)
-        finally:
-            response.close()
+                # This permit covers event parsing through result decode/write in bridge.py, but not the upstream wait.
+                with image_processing_slots:
+                    yield from self._iter_codex_response_events(raw)
+            finally:
+                response.close()
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""

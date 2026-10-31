@@ -2,6 +2,7 @@ import OSS from 'ali-oss'
 import { resolve } from 'node:path'
 import { stat, unlink } from 'node:fs/promises'
 import { settings, type ImageRow } from './store'
+import { withImageTransfer } from './image-transfers'
 
 export function ossClient() {
   const s = settings(), o = s.oss
@@ -18,7 +19,7 @@ export async function persistImage(image: ImageRow, baseUrl: string) {
   const extension = image.mime === 'image/svg+xml' ? 'svg' : 'png'
   const key = image.object_key || `${prefix}/${new Date().toISOString().slice(0, 10)}/${image.task_id}/${image.id}.${extension}`
   // Stream from disk; never hold the whole seven-image task in Bun memory.
-  await client.put(key, resolve(image.local_path), { headers: { 'Content-Type': image.mime || 'image/png' } })
+  await withImageTransfer(() => client.put(key, resolve(image.local_path!), { headers: { 'Content-Type': image.mime || 'image/png' } }))
   const url = s.publicBaseUrl ? `${s.publicBaseUrl.replace(/\/$/, '')}/${key}` : await client.signatureUrl(key, { expires: s.oss.urlExpiry })
   return { url, key }
 }

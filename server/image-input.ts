@@ -91,10 +91,13 @@ export async function saveReferences(uploads: Upload[]) {
     finally { await unlink(temporary).catch(() => {}) }
   }
 }
-export async function uploadedReference(value: string) {
-  const file = Bun.file(referencePath(value))
+export async function uploadedReferenceFile(value: string) {
+  const path = referencePath(value), file = Bun.file(path)
   if (!await file.exists()) throw new Error('上传的参考图文件不存在，请重新提交图片')
   if (file.size > MAX_IMAGE_BYTES) throw new Error('单张参考图不能超过 10 MB')
-  const bytes = new Uint8Array(await file.arrayBuffer())
+  return path
+}
+export async function uploadedReference(value: string) {
+  const bytes = new Uint8Array(await Bun.file(await uploadedReferenceFile(value)).arrayBuffer())
   return `data:${imageMime(bytes)};base64,${Buffer.from(bytes).toString('base64')}`
 }
