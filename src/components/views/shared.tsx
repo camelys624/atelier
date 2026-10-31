@@ -29,7 +29,7 @@ export async function copy(value: string, message = '已复制') {
 }
 
 export function EmptyArt() {
-  return <div className="empty-art" aria-hidden><div className="sheet" /><div className="sheet" /><div className="sheet"><ImageIcon size={25} strokeWidth={1.2} /></div><span className="absolute bottom-1 right-0 flex size-6 items-center justify-center rounded-full border-3 border-white bg-[#e7ebdc] text-[#6d7d4a]"><Plus size={13} /></span></div>
+  return <div className="empty-art" aria-hidden><div className="sheet" /><div className="sheet" /><div className="sheet"><ImageIcon size={25} strokeWidth={1.2} /></div><span className="absolute bottom-1 right-0 flex size-6 items-center justify-center rounded-full border-3 border-white bg-accent-soft text-accent-text"><Plus size={13} /></span></div>
 }
 
 export function Tabs<T extends string>({ value, onChange, items, label }: { value: T; onChange: (value: T) => void; items: { key: T; label: string; count?: number; alert?: boolean }[]; label: string }) {

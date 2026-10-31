@@ -13,13 +13,13 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
     try { await api('/api/auth/login', { key }); onSuccess() } catch (error: any) { toast.error(error.message) } finally { setBusy(false) }
   }
   return <div className="grid min-h-screen lg:grid-cols-[1fr_1fr]">
-    <div className="relative hidden overflow-hidden bg-[#485340] p-12 text-[#eef0e7] lg:flex lg:flex-col">
-      <div className="wordmark !px-0"><span className="brand-icon !bg-[#d7bd9c] !text-[#485340]">a</span>atelier.</div>
+    <div className="relative hidden overflow-hidden bg-[#0f1729] p-12 text-[#e6ebf5] lg:flex lg:flex-col">
+      <div className="wordmark !px-0"><span className="brand-icon">a</span>atelier.</div>
       <div className="login-orbit" /><div className="login-orbit !size-[650px]" />
       <div className="relative m-auto">
-        <div className="mx-auto mb-9 flex size-24 items-center justify-center rounded-3xl border border-[#d9dec744] bg-[#c7d2aa14] shadow-xl"><Layers2 size={40} strokeWidth={1} /></div>
+        <div className="mx-auto mb-9 flex size-24 items-center justify-center rounded-3xl border border-white/15 bg-white/5 shadow-xl"><Layers2 size={40} strokeWidth={1} /></div>
         <h1 className="text-center text-[38px] font-light tracking-[-1.5px]">从一个想法，<br />到每一张好图片。</h1>
-        <p className="mt-6 text-center text-sm leading-7 text-[#d3dac7]">账号池、任务与图片交付。<br />一个简单、属于你的生图服务。</p>
+        <p className="mt-6 text-center text-sm leading-7 text-[#aab4c8]">账号池、任务与图片交付。<br />一个简单、属于你的生图服务。</p>
       </div>
     </div>
     <div className="flex items-center justify-center px-8 py-20">

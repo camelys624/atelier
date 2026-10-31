@@ -60,7 +60,7 @@ export function TaskDetail({ id, listed, open, onOpenChange, action, now }: { id
       </div>
       <div className="my-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[13px] text-muted-foreground">
-          <span>已交付 <span className="tabular-nums text-foreground">{task.completed} / {task.n}</span> 张{task.failed > 0 && <span className="ml-2 text-[#a1443a]">{task.failed} 张失败</span>}</span>
+          <span>已交付 <span className="tabular-nums text-foreground">{task.completed} / {task.n}</span> 张{task.failed > 0 && <span className="ml-2 text-bad-ink">{task.failed} 张失败</span>}</span>
           <span className="flex items-center gap-1.5" title="从提交到结束，包含排队等待"><Clock3 size={13} />总耗时 <span className="tabular-nums text-foreground">{formatDuration(taskTiming(task, now).total)}</span></span>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -73,12 +73,12 @@ export function TaskDetail({ id, listed, open, onOpenChange, action, now }: { id
         {task.images.map((image, index) => {
           const timing = imageTiming(image, task, now), viewIndex = viewable.indexOf(image)
           return <div key={image.id} className="overflow-hidden rounded-xl border">
-            <div className="relative aspect-[4/5] bg-[#f3f5ed]">
+            <div className="relative aspect-[4/5] bg-muted">
               {viewIndex >= 0 ? <button className="group size-full" aria-label={`查看第 ${index + 1} 张大图`} onClick={() => setViewing(viewIndex)}>
                 <img className="size-full object-cover" src={image.url!} alt={`第 ${index + 1} 张${task.demo ? '演示' : '生成'}图片`} loading="lazy" />
                 <span className="absolute right-2 top-2 rounded-md bg-black/45 p-1.5 text-white opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"><Maximize2 size={13} /></span>
               </button> : <div className="flex size-full flex-col items-center justify-center gap-3 text-muted-foreground">
-                {['generating', 'uploading'].includes(image.status) ? <Loader2 className="animate-spin" size={22} /> : image.status === 'error' ? <X size={23} className="text-[#a1443a]" /> : <ImageIcon size={23} strokeWidth={1.3} />}
+                {['generating', 'uploading'].includes(image.status) ? <Loader2 className="animate-spin" size={22} /> : image.status === 'error' ? <X size={23} className="text-bad-ink" /> : <ImageIcon size={23} strokeWidth={1.3} />}
                 <span className="text-xs">{statuses[image.status]?.text || image.status}</span>
               </div>}
             </div>
@@ -87,7 +87,7 @@ export function TaskDetail({ id, listed, open, onOpenChange, action, now }: { id
               <p className="flex items-center justify-between gap-2" title="含参考图读取、生图与上传"><span>处理</span><span className="tabular-nums text-soft">{formatDuration(timing.processing)}</span></p>
               <p className="flex items-center justify-between gap-2"><span>{image.status === 'queued' ? '已排队' : '排队等待'}</span><span className="tabular-nums">{formatDuration(timing.waiting)}</span></p>
             </div>
-            {image.error && <p className="border-t px-3 py-2 text-xs leading-5 text-[#a1443a]">{image.error}</p>}
+            {image.error && <p className="border-t px-3 py-2 text-xs leading-5 text-bad-ink">{image.error}</p>}
           </div>
         })}
       </div>
