@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import OSS from 'ali-oss'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -13,7 +13,8 @@ process.env.MASTER_KEY = '11'.repeat(32)
 const store = await import('../server/store')
 const { handleApi } = await import('../server/api')
 const scheduler = await import('../server/scheduler')
-const { validateImageUrl } = await import('../server/network')
+const { validateImageUrl, fetchReference } = await import('../server/network')
+const { withImageTransfer } = await import('../server/image-transfers')
 const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/device-auth')
 const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
 const { MAX_UPLOAD_BYTES, referencePath, uploadedReference } = await import('../server/image-input')
@@ -481,6 +482,61 @@ describe('durable queue and resource reservations', () => {
     await expect(validateImageUrl('https://not-allowed.example/image.png')).rejects.toThrow('允许列表')
     saveSettings({ ...defaults, allowedImageHosts: ['127.0.0.1'] })
     await expect(validateImageUrl('https://127.0.0.1/image.png')).rejects.toThrow('私有网络')
+  })
+})
+describe('bounded image transfers', () => {
+  test('writes reference chunks to disk before the response ends', async () => {
+    saveSettings({ ...defaults, allowedImageHosts: ['8.8.8.8'] })
+    const path = join(temporary, 'streamed-reference.png')
+    let controller!: ReadableStreamDefaultController<Uint8Array>, closed = false
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; controller.enqueue(new Uint8Array([1, 2, 3])) } })
+    const fetch = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(stream, { headers: { 'Content-Type': 'image/png' } }))
+    const downloading = fetchReference('https://8.8.8.8/image.png', path)
+    try {
+      await waitFor(() => existsSync(path) && statSync(path).size === 3)
+      expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3])
+      controller.enqueue(new Uint8Array([4, 5])); controller.close(); closed = true
+      await downloading
+      expect([...new Uint8Array(await Bun.file(path).arrayBuffer())]).toEqual([1, 2, 3, 4, 5])
+      expect(fetch.mock.calls[0][1]?.redirect).toBe('error')
+    } finally {
+      if (!closed) controller.close()
+      await downloading.catch(() => {})
+      fetch.mockRestore()
+    }
+  })
+  test('removes partial references on oversized or broken responses and cancels rejected bodies', async () => {
+    saveSettings({ ...defaults, allowedImageHosts: ['8.8.8.8'] })
+    let rejectedCancelled = false
+    const cases = [
+      { name: 'oversized', body: () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array(10 * 1024 * 1024)); c.enqueue(new Uint8Array([1])); c.close() } }), type: 'image/png', error: '10 MB' },
+      { name: 'broken', body: () => new ReadableStream({ async pull(c) { c.enqueue(new Uint8Array([1])); await Bun.sleep(10); c.error(new Error('connection closed')) } }), type: 'image/png', error: 'connection closed' },
+      { name: 'empty', body: () => new ReadableStream({ start(c) { c.close() } }), type: 'image/png', error: '内容为空' },
+      { name: 'unsupported', body: () => new ReadableStream({ cancel() { rejectedCancelled = true } }), type: 'text/plain', error: 'PNG' },
+    ]
+    for (const item of cases) {
+      const path = join(temporary, `${item.name}-reference.png`), body = item.body()
+      const fetch = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(body, { headers: { 'Content-Type': item.type } }))
+      try {
+        await expect(fetchReference('https://8.8.8.8/image.png', path)).rejects.toThrow(item.error)
+        expect(await Bun.file(path).exists()).toBe(false)
+      } finally { fetch.mockRestore() }
+    }
+    expect(rejectedCancelled).toBe(true)
+  })
+  test('shares transfer permits fairly and releases them after failures', async () => {
+    let active = 0, peak = 0
+    const started: number[] = []
+    const result = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => withImageTransfer(async () => {
+      active++; peak = Math.max(peak, active); started.push(index)
+      try { await Bun.sleep(10); if (index % 3 === 0) throw new Error('transfer failed'); return index }
+      finally { active-- }
+    })))
+    expect(started).toEqual(Array.from({ length: 20 }, (_, index) => index))
+    expect(peak).toBeLessThanOrEqual(Math.max(1, Math.min(32, Number.parseInt(process.env.IMAGE_TRANSFER_CONCURRENCY || '', 10) || 4)))
+    expect(active).toBe(0)
+    expect(result.filter(item => item.status === 'rejected')).toHaveLength(7)
+    expect(await withImageTransfer(async () => 'recovered')).toBe('recovered')
   })
 })
 describe('adapter worker pool', () => {

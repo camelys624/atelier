@@ -38,7 +38,17 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend.base_url = 'https://chatgpt.com'
         backend._ensure_codex_source_account = Mock()
         backend.session = Mock()
-        backend.session.post.return_value = Mock(status_code=200, headers={'content-type': 'text/event-stream'}, content=content)
+        backend.session.curl_options = {}
+        response = Mock(status_code=200, headers={'content-type': 'text/event-stream'}, content=b'')
+        def post(*_, **kwargs):
+            from curl_cffi import CurlOpt
+            read = backend.session.curl_options[CurlOpt.READFUNCTION]
+            backend.sent_payload = json.loads(b''.join(iter(lambda: read(1024), b'')))
+            callback = kwargs['content_callback']
+            for index in range(0, len(content), 17): callback(content[index:index + 17])
+            return response
+        backend.session.post.side_effect = post
+        backend.session.post.return_value = response
         return backend
 
     def test_bridge_preserves_model_size_quality_and_order(self):
@@ -63,7 +73,7 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend._iter_codex_response_events = Mock(return_value=iter([]))
         with patch.dict(os.environ, {'CODEX_RESPONSES_MODEL': ''}):
             list(backend.iter_codex_image_response_events(prompt='combine', images=['data:image/png;base64,first', 'data:image/png;base64,second'], size='1536x1024', quality='high', model='gpt-image-2.5-sunburst'))
-        payload = backend.session.post.call_args.kwargs['json']
+        payload = backend.sent_payload
         self.assertEqual(payload['model'], 'gpt-6.1-sol')
         self.assertEqual(payload['tools'][0], {'type': 'image_generation', 'model': 'gpt-image-2.5-sunburst', 'action': 'edit', 'size': '1536x1024', 'quality': 'high', 'output_format': 'png'})
         self.assertEqual([part['image_url'] for part in payload['input'][0]['content'][1:]], ['data:image/png;base64,first', 'data:image/png;base64,second'])
@@ -75,7 +85,7 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend._iter_codex_response_events = Mock(return_value=iter([]))
         with patch.dict(os.environ, {'CODEX_RESPONSES_MODEL': ' custom-account-model '}):
             list(backend.iter_codex_image_response_events(prompt='test', model='gpt-image-2.5-sunburst'))
-        payload = backend.session.post.call_args.kwargs['json']
+        payload = backend.sent_payload
         self.assertEqual(payload['model'], 'custom-account-model')
         self.assertEqual(payload['tools'][0]['model'], 'gpt-image-2.5-sunburst')
 
@@ -84,6 +94,151 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend = self.backend(('data: ' + json.dumps(event) + '\n\ndata: [DONE]\n\n').encode())
         self.assertEqual(list(backend.iter_codex_image_response_events(prompt='test')), [event])
         backend.session.post.assert_called_once()
+
+    def test_sse_parser_yields_events_without_reading_the_whole_response(self):
+        from services.openai_backend_api import OpenAIBackendAPI
+        first = {'type': 'response.output_item.done', 'item': {'type': 'image_generation_call', 'result': 'b2s='}}
+        second = {'type': 'response.completed', 'response': {'output': []}}
+        class IncrementalBody(io.BytesIO):
+            headers = {'content-type': 'text/event-stream'}
+            status = 200
+            def read(self, size=-1):
+                if size < 0: raise AssertionError('full response read retains every image in memory')
+                return super().read(size)
+        raw = IncrementalBody(('data: ' + json.dumps(first) + '\n\ndata: ' + json.dumps(second) + '\n\n').encode())
+        events = OpenAIBackendAPI._iter_codex_response_events(raw)
+        self.assertEqual(next(events), first)
+        self.assertLess(raw.tell(), len(raw.getvalue()))
+        self.assertEqual(list(events), [second])
+
+    def test_streams_local_reference_files_into_the_json_request_in_order(self):
+        backend = self.backend()
+        data = b'\x89PNG\r\n\x1a\n' + os.urandom(120_007)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'reference.png'
+            path.write_bytes(data)
+            with patch.object(Path, 'read_bytes', side_effect=AssertionError('must encode reference files in chunks')):
+                list(backend.iter_codex_image_response_events(prompt='中文 "prompt"', images=[str(path), 'data:image/png;base64,b2s=']))
+        content = backend.sent_payload['input'][0]['content']
+        self.assertEqual(content[0]['text'], '中文 "prompt"')
+        self.assertEqual(base64.b64decode(content[1]['image_url'].split(',')[1], validate=True), data)
+        self.assertEqual(content[2]['image_url'], 'data:image/png;base64,b2s=')
+        self.assertEqual(backend.session.curl_options, {})
+
+    def test_sse_multiline_json_errors_and_final_event_without_separator(self):
+        from services.openai_backend_api import OpenAIBackendAPI
+        raw = io.BytesIO(b': comment\r\nevent: ignored\r\ndata: {"type":\r\ndata: "response.completed"}\r\n\r\ndata: invalid\n\ndata: [DONE]\n\ndata: {"type":"last"}')
+        raw.headers = {'content-type': 'text/event-stream'}
+        self.assertEqual(list(OpenAIBackendAPI._iter_codex_response_events(raw)), [{'type': 'response.completed'}, {'type': 'last'}])
+
+    def test_accepts_json_response_with_the_same_transport(self):
+        event = {'output': [{'type': 'image_generation_call', 'result': 'b2s='}]}
+        backend = self.backend(json.dumps(event).encode())
+        backend.session.post.return_value.headers = {'content-type': 'application/json'}
+        self.assertEqual(list(backend.iter_codex_image_response_events(prompt='test')), [event])
+
+    def test_file_transport_preserves_chunked_http_errors_and_truncation(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from curl_cffi import requests
+        from curl_cffi.requests.exceptions import RequestException
+        event = {'type': 'response.completed', 'response': {'output': [{'type': 'image_generation_call', 'result': 'b2s='}]}}
+        response_body = ('data: ' + json.dumps(event) + '\n\ndata: [DONE]\n\n').encode()
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *_): pass
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                received.append(payload)
+                mode = payload['input'][0]['content'][0]['text']
+                self.send_response(400 if mode == 'error' else 200)
+                self.send_header('Content-Type', 'application/json' if mode == 'error' else 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.close_connection = True
+                if mode == 'error':
+                    body = b'{"error":{"code":"model_not_found"}}'
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+                elif mode == 'truncated':
+                    self.send_header('Content-Length', str(len(response_body) + 500))
+                    self.end_headers(); self.wfile.write(response_body)
+                else:
+                    self.send_header('Transfer-Encoding', 'chunked')
+                    self.end_headers()
+                    for index in range(0, len(response_body), 17):
+                        chunk = response_body[index:index + 17]
+                        self.wfile.write(f'{len(chunk):x}\r\n'.encode() + chunk + b'\r\n')
+                    self.wfile.write(b'0\r\n\r\n')
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        backend = self.backend()
+        backend.session = requests.Session(impersonate='edge101')
+        backend.base_url = f'http://127.0.0.1:{server.server_port}'
+        try:
+            self.assertEqual(list(backend.iter_codex_image_response_events(prompt='success', images=['data:image/png;base64,b2s='])), [event])
+            self.assertEqual(received[0]['input'][0]['content'][1]['image_url'], 'data:image/png;base64,b2s=')
+            with self.assertRaisesRegex(Exception, 'model_not_found'):
+                list(backend.iter_codex_image_response_events(prompt='error'))
+            with self.assertRaises(RequestException):
+                list(backend.iter_codex_image_response_events(prompt='truncated'))
+            self.assertEqual(len(received), 3)  # no automatic generation replay, including incomplete HTTP transfers
+            self.assertEqual(backend.session.curl_options, {})
+        finally:
+            backend.session.close()
+            server.shutdown(); server.server_close(); thread.join(2)
+
+    def test_bounds_result_processing_without_serializing_upstream_requests(self):
+        from services import openai_backend_api
+        release, entered = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        counts = {'active': 0, 'peak': 0}
+        backends = [self.backend() for _ in range(4)]
+        errors = []
+        def parse(_):
+            with lock:
+                counts['active'] += 1
+                counts['peak'] = max(counts['peak'], counts['active'])
+                if counts['active'] == 2: entered.set()
+            try:
+                if not release.wait(3): raise RuntimeError('test barrier timed out')
+                yield {'type': 'image_generation_call', 'result': 'b2s='}
+            finally:
+                with lock: counts['active'] -= 1
+        def run(backend):
+            try: list(backend.iter_codex_image_response_events(prompt='test'))
+            except Exception as error: errors.append(error)
+        with patch.object(openai_backend_api, 'image_processing_slots', threading.BoundedSemaphore(2)):
+            for backend in backends: backend._iter_codex_response_events = parse
+            threads = [threading.Thread(target=run, args=(backend,)) for backend in backends]
+            try:
+                for thread in threads: thread.start()
+                self.assertTrue(entered.wait(2))
+                deadline = time.monotonic() + 2
+                while sum(backend.session.post.call_count for backend in backends) < 4 and time.monotonic() < deadline: time.sleep(0.01)
+                self.assertTrue(all(backend.session.post.call_count == 1 for backend in backends))
+                self.assertEqual(counts['peak'], 2)
+            finally:
+                release.set()
+                for thread in threads: thread.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(counts['active'], 0)
+
+    def test_drops_duplicate_image_events_and_closes_the_transport(self):
+        from services.protocol import conversation
+        backend = Mock()
+        closed = []
+        def events(**_):
+            try:
+                yield {'type': 'response.output_item.done', 'item': {'type': 'image_generation_call', 'result': 'b2s='}}
+                raise AssertionError('must not retain duplicate results in response.completed')
+            finally: closed.append(True)
+        backend.iter_codex_image_response_events.side_effect = events
+        results = conversation.stream_codex_image_outputs(backend, conversation.ConversationRequest(model='codex-gpt-image-2', prompt='test'))
+        self.assertEqual(next(results).data[0]['b64_json'], 'b2s=')
+        self.assertEqual(closed, [])
+        results.close()
+        self.assertEqual(closed, [True])
 
     def test_preserves_upstream_errors_without_automatically_retrying(self):
         backend = self.backend()
@@ -245,7 +400,7 @@ class WorkerTests(unittest.TestCase):
         finally: tracemalloc.stop()
         self.assertLess(held[0], 4 * 1024 * 1024)
 
-    def test_codex_reference_files_are_sent_inline_and_web_keeps_paths(self):
+    def test_reference_paths_reach_the_protocol_without_inline_copies(self):
         png = b'\x89PNG\r\n\x1a\n' + b'pixels'
         captured = {}
         def factory(token):
@@ -260,8 +415,7 @@ class WorkerTests(unittest.TestCase):
             reference.write_bytes(png)
             results = self.serve([{'action': 'generate', 'account': {'source_type': 'codex', 'access_token': 'token'}, 'prompt': 'x', 'model': 'codex-gpt-image-2', 'images': [str(reference), 'data:image/png;base64,abc'], 'output': str(Path(directory) / 'out.png')}], factory)
             self.assertTrue(results[0]['ok'], results[0])
-            self.assertEqual(captured['images'], ['data:image/png;base64,' + base64.b64encode(png).decode(), 'data:image/png;base64,abc'])
-            self.assertEqual(self.ctx['reference_image'](str(reference), False), str(reference))
+            self.assertEqual(captured['images'], [str(reference), 'data:image/png;base64,abc'])
 
 if __name__ == '__main__':
     unittest.main()

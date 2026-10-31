@@ -98,7 +98,7 @@ async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
       if (isUploadedReference(reference)) { refs.push(await uploadedReferenceFile(reference)); continue }
       const path = resolve(dataDir, 'spool', `${image.id}.${image.attempts}.ref${index}`)
       downloaded.push(path)
-      await Bun.write(path, await fetchReference(reference))
+      await fetchReference(reference, path)
       refs.push(path)
     }
     const result = task.demo ? await demoImage(image.id, image.position) : await generateImage(account!, { prompt: task.prompt, model: task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts })

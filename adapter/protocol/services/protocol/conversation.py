@@ -1266,25 +1266,27 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    images = _codex_response_images(list(backend.iter_codex_image_response_events(
+    events = backend.iter_codex_image_response_events(
         prompt=request.prompt,
         images=request.images or [],
         size=request.size,
         quality=request.quality,
         model=request.model.removeprefix("codex-"),
-    )))
-    if not images:
-        raise ImageGenerationError("No image result found in response")
-    data = format_image_result(
-        [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
-        request.prompt,
-        request.response_format,
-        request.base_url,
-        int(time.time()),
-    )["data"]
-    if data:
-        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
-        return
+    )
+    try:
+        for event in events:
+            images = _codex_response_images(event)
+            if not images: continue
+            data = format_image_result(
+                [{"b64_json": item, "revised_prompt": request.prompt} for item in images],
+                request.prompt, request.response_format, request.base_url, int(time.time()),
+            )["data"]
+            if data:
+                yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
+                return
+    finally:
+        close = getattr(events, 'close', None)
+        if close: close()
     raise ImageGenerationError("No image result found in response")
 
 

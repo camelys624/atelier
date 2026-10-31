@@ -123,14 +123,6 @@ def refreshed_account(values=None):
             values['expires_at'] = int(time.time()) + int(result['expires_in'])
     return values
 
-def reference_image(value, inline):
-    # References arrive as local file paths so large images never cross the IPC pipe.
-    # The web protocol reads paths itself; Codex requests need the image inline as a data URL.
-    if not inline or value.startswith('data:') or len(value) > 4096 or not os.path.isfile(value): return value
-    data = Path(value).read_bytes()
-    mime = 'image/png' if data[:8] == b'\x89PNG\r\n\x1a\n' else 'image/jpeg' if data[:3] == b'\xff\xd8\xff' else 'image/webp' if data[:4] == b'RIFF' and data[8:12] == b'WEBP' else 'application/octet-stream'
-    return f'data:{mime};base64,{base64.b64encode(data).decode("ascii")}'
-
 # Keep the bytes in this process and write one result to the spool; no base64 IPC output.
 def format_result(items, prompt, response_format, base_url=None, created=None, message=''):
     return {'created': created or int(time.time()), 'data': items}
@@ -169,21 +161,22 @@ def execute(request=None):
         codex = values.get('source_type') == 'codex'
         image_request = conversation.ConversationRequest(
             prompt=request['prompt'], model=request['model'], n=1,
-            images=[reference_image(item, codex) for item in request.get('images') or []], size=request.get('size') or '1024x1024',
+            images=request.get('images') or [], size=request.get('size') or '1024x1024',
             quality=request.get('quality') or 'auto', response_format='b64_json', message_as_error=True,
         )
         source = conversation.stream_codex_image_outputs if codex else conversation.stream_image_outputs
-        for result in source(backend, image_request):
-            if result.kind == 'message': raise RuntimeError('上游未生成图片：' + str(result.text or '')[:200])
-            if result.kind != 'result': continue
-            for item in result.data:
-                if not item.get('b64_json'): continue
-                raw = base64.b64decode(item['b64_json'], validate=True)
-                target = Path(request['output'])
-                temp = target.with_suffix('.part')
-                temp.write_bytes(raw)
-                temp.replace(target)
-                return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png', 'credentials': credential_values(values)}
+        with contextlib.closing(source(backend, image_request)) as results:
+            for result in results:
+                if result.kind == 'message': raise RuntimeError('上游未生成图片：' + str(result.text or '')[:200])
+                if result.kind != 'result': continue
+                for item in result.data:
+                    if not item.get('b64_json'): continue
+                    raw = base64.b64decode(item['b64_json'], validate=True)
+                    target = Path(request['output'])
+                    temp = target.with_suffix('.part')
+                    temp.write_bytes(raw)
+                    temp.replace(target)
+                    return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png', 'credentials': credential_values(values)}
         raise RuntimeError('上游未返回图片结果')
     finally:
         backend.close()

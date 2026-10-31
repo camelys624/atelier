@@ -1,6 +1,8 @@
 import { lookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
+import { open, unlink } from 'node:fs/promises'
 import { settings } from './store'
+import { withImageTransfer } from './image-transfers'
 
 function privateAddress(value: string): boolean {
   const ip = value.toLowerCase()
@@ -21,26 +23,35 @@ export async function validateImageUrl(value: string) {
   if (!addresses.length || addresses.some(a => privateAddress(a.address))) throw new Error('参考图地址不能指向私有网络')
   return url
 }
-export async function fetchReference(value: string) {
-  const url = await validateImageUrl(value)
-  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(30_000) })
-  if (!response.ok) throw new Error(`读取参考图失败（HTTP ${response.status}）`)
-  const type = response.headers.get('content-type')?.split(';')[0] || ''
-  if (!['image/png', 'image/jpeg', 'image/webp'].includes(type)) throw new Error('参考图仅支持 PNG、JPEG、WebP')
-  const max = 10 * 1024 * 1024
-  if (Number(response.headers.get('content-length')) > max) throw new Error('单张参考图不能超过 10 MB')
-  const reader = response.body?.getReader()
-  if (!reader) throw new Error('参考图内容为空')
-  const chunks: Uint8Array[] = []; let size = 0
-  try {
-    while (true) {
-      const { done, value: chunk } = await reader.read()
-      if (done) break
-      size += chunk.length
-      if (size > max) throw new Error('单张参考图不能超过 10 MB')
-      chunks.push(chunk)
+export async function fetchReference(value: string, target: string) {
+  return withImageTransfer(async () => {
+    const url = await validateImageUrl(value)
+    const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(30_000) })
+    let file: Awaited<ReturnType<typeof open>> | undefined, reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    let size = 0, complete = false
+    try {
+      if (!response.ok) throw new Error(`读取参考图失败（HTTP ${response.status}）`)
+      const type = response.headers.get('content-type')?.split(';')[0] || ''
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(type)) throw new Error('参考图仅支持 PNG、JPEG、WebP')
+      const max = 10 * 1024 * 1024
+      if (Number(response.headers.get('content-length')) > max) throw new Error('单张参考图不能超过 10 MB')
+      reader = response.body?.getReader()
+      if (!reader) throw new Error('参考图内容为空')
+      file = await open(target, 'wx', 0o600)
+      while (true) {
+        const { done, value: chunk } = await reader.read()
+        if (done) break
+        size += chunk.length
+        if (size > max) throw new Error('单张参考图不能超过 10 MB')
+        await file.writeFile(chunk)
+      }
+      if (!size) throw new Error('参考图内容为空')
+      complete = true
+    } finally {
+      if (reader) await reader.cancel().catch(() => {})
+      else await response.body?.cancel().catch(() => {})
+      try { await file?.close() }
+      finally { if (file && !complete) await unlink(target).catch(() => {}) }
     }
-  } finally { await reader.cancel().catch(() => {}) }
-  if (!size) throw new Error('参考图内容为空')
-  return Buffer.concat(chunks)
+  })
 }
