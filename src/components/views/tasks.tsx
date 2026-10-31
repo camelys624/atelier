@@ -4,7 +4,7 @@ import { toast } from 'sonner'
 import { Button } from '../ui/button'
 import { Input, Textarea } from '../ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../ui/dialog'
-import { api, type Snapshot, type Task } from '@/lib/client'
+import { api, preferredModel, type Snapshot, type Task } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { formatDuration, taskTiming } from '@/lib/timing'
 import { EmptyArt, Field, Status, Tabs, short, time } from './shared'
@@ -64,9 +64,11 @@ export function Tasks({ data, create, openTask }: { data: Snapshot; create: () =
 
 export function CreateTask({ open, onOpenChange, data, complete }: { open: boolean; onOpenChange: (value: boolean) => void; data: Snapshot; complete: (task: Task) => Promise<void> }) {
   const anyReady = data.accounts.some(a => a.status === 'ready')
-  const [prompt, setPrompt] = useState(''), [model, setModel] = useState('gpt-image-2'), [n, setN] = useState(7), [urls, setUrls] = useState(''), [demo, setDemo] = useState(!anyReady), [busy, setBusy] = useState(false)
-  useEffect(() => { if (open && !anyReady) setDemo(true) }, [open])
-  const source = model === 'gpt-image-2' ? 'web' : 'codex', ready = data.accounts.filter(a => a.source === source && a.status === 'ready'), usable = ready.length
+  const [prompt, setPrompt] = useState(''), [model, setModel] = useState(() => preferredModel(data.models)), [n, setN] = useState(7), [urls, setUrls] = useState(''), [demo, setDemo] = useState(!anyReady), [busy, setBusy] = useState(false)
+  // Reopening the dialog moves off a model whose accounts are gone, so the default always has a usable account.
+  useEffect(() => { if (!open) return; if (!anyReady) setDemo(true); if (!data.models.find(m => m.id === model)?.accounts) setModel(preferredModel(data.models)) }, [open])
+  const selected = data.models.find(m => m.id === model), source = selected?.source || 'codex', usable = selected?.accounts || 0
+  const ready = data.accounts.filter(a => a.source === source && a.status === 'ready')
   const free = ready.reduce((sum, a) => sum + Math.max(0, a.slots - a.inflight), 0)
   const refs = urls.split(/\s+/).filter(Boolean), tooMany = !demo && refs.length > 7
   async function submit(event: React.FormEvent) {
@@ -84,7 +86,7 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="生成模型" help={demo ? undefined : usable ? `${usable} 个可用${source === 'codex' ? ' Codex ' : ' ChatGPT '}账号` : <span className="flex items-center gap-1 text-[#85652f]"><TriangleAlert size={12} />没有可用的{source === 'codex' ? ' Codex ' : ' ChatGPT '}账号</span>}>
-          <select className="select" value={model} onChange={e => setModel(e.target.value)}><option value="gpt-image-2">ChatGPT · GPT Image 2</option><option value="codex-gpt-image-2">Codex · GPT Image 2</option><option value="gpt-image-2.5-sunburst">Codex · GPT Image 2.5 Sunburst</option></select>
+          <select className="select" value={model} onChange={e => setModel(e.target.value)}>{data.models.map(m => <option key={m.id} value={m.id}>{m.source === 'codex' ? 'Codex' : 'ChatGPT'} · {m.name}{m.accounts ? '' : '（无可用账号）'}</option>)}</select>
         </Field>
         <Field label="图片数量"><select className="select" value={n} onChange={e => setN(Number(e.target.value))}>{[1, 2, 3, 4, 5, 6, 7].map(value => <option value={value} key={value}>{value} 张{value === 7 ? ' · 一组' : ''}</option>)}</select></Field>
       </div>

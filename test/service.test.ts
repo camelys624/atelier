@@ -470,7 +470,11 @@ describe('durable queue and resource reservations', () => {
     db.run("UPDATE accounts SET source='codex',plan='prolite' WHERE id='codex-only'")
     const response = await request('/v1/image-tasks', { model: 'gpt-image-2', prompt: 'source mismatch' })
     expect(response.status).toBe(409)
-    expect((await response.json()).error.message).toContain('ChatGPT 网页来源账号')
+    const message = (await response.json()).error.message
+    expect(message).toContain('ChatGPT 网页来源账号')
+    expect(message).toContain('当前可用的模型：codex-gpt-image-2、gpt-image-2.5-sunburst')
+    const models = (await (await request('/v1/models')).json()).data
+    expect(Object.fromEntries(models.map((m: any) => [m.id, m.available]))).toEqual({ 'gpt-image-2': false, 'codex-gpt-image-2': true, 'gpt-image-2.5-sunburst': true })
   })
   test('rejects untrusted image domains and private reference addresses', async () => {
     await expect(validateImageUrl('https://not-allowed.example/image.png')).rejects.toThrow('允许列表')

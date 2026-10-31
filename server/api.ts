@@ -1,4 +1,4 @@
-import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Task, type Settings, type ImageRow } from './store'
+import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Account, type Task, type Settings, type ImageRow } from './store'
 import { refreshAccount, safeError } from './adapter'
 import { submitTask, taskFingerprint, retryTask, pump, baseUrl } from './scheduler'
 import { imageUrl, imageBase64, testOss } from './storage'
@@ -6,7 +6,7 @@ import { validateImageUrl } from './network'
 import { normalizeAccount, saveAccount } from './accounts'
 import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
-import { IMAGE_MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
+import { IMAGE_MODELS, MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
 import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
@@ -38,6 +38,11 @@ function identity(request: Request): Identity {
     if (cookie && db.query('SELECT 1 FROM sessions WHERE token_hash=? AND expires>?').get(hash(cookie), Date.now())) return { owner: 'admin', admin: true, cookie }
   }
   throw new HttpError(401, '请登录或使用有效的 API 密钥')
+}
+const usableAccount = (a: Account) => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (a.source !== 'codex' || supportsCodexImages(a.plan))
+function modelList() {
+  const usable = accounts().filter(usableAccount)
+  return MODELS.map(model => ({ ...model, accounts: usable.filter(a => a.source === model.source).length }))
 }
 function checkOrigin(request: Request) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.headers.has('authorization')) return
@@ -85,8 +90,10 @@ async function createTask(request: Request, input: any, who: Identity) {
   if (!demo) {
     const source = accountSource(model)
     const pool = accounts().filter(a => a.source === source)
-    if (!pool.length) throw new HttpError(409, `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号`)
-    if (!pool.some(a => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (source !== 'codex' || supportsCodexImages(a.plan)))) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型`)
+    const others = modelList().filter(m => m.id !== model && m.accounts > 0).map(m => m.id)
+    const hint = others.length ? `；当前可用的模型：${others.join('、')}` : ''
+    if (!pool.length) throw new HttpError(409, `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号${hint}`)
+    if (!pool.some(usableAccount)) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型${hint}`)
   }
   await saveReferences(uploads)
   const task = submitTask({ owner: who.owner, prompt, model, size, quality, n, refs, demo, clientId })
@@ -130,7 +137,7 @@ export async function handleApi(request: Request): Promise<Response> {
       const counts = db.query<{ status: string; count: number }, []>('SELECT status,COUNT(*) AS count FROM images GROUP BY status').all()
       const delivered = db.query<{ status: string; count: number }, []>("SELECT images.status,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status IN ('success','error') GROUP BY images.status").all()
       const hourly = db.query("SELECT CAST(images.finished/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status='success' AND images.finished>? GROUP BY hour ORDER BY hour").all(Date.now() - 24 * 3600_000)
-      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, serverTime: Date.now(), baseUrl: baseUrl() })
+      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, models: modelList(), serverTime: Date.now(), baseUrl: baseUrl() })
     }
     if (path === '/api/accounts' && request.method === 'POST') {
       const input = await body(request)
@@ -191,7 +198,7 @@ export async function handleApi(request: Request): Promise<Response> {
       saveSettings(value); return json({ ok: true })
     }
     if (path === '/api/settings/test-oss' && request.method === 'POST') return json(await testOss())
-    if (path === '/v1/models') return json({ object: 'list', data: IMAGE_MODELS.map(model => ({ id: model, object: 'model', owned_by: 'atelier' })) })
+    if (path === '/v1/models') return json({ object: 'list', data: modelList().map(model => ({ id: model.id, object: 'model', owned_by: 'atelier', available: model.accounts > 0 })) })
     if (['/api/tasks', '/v1/image-tasks', '/v1/images/generations', '/v1/images/edits'].includes(path) && request.method === 'POST') {
       const input = await imageBody(request, body)
       const task = await createTask(request, input, who)

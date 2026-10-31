@@ -5,8 +5,14 @@ import { HttpError } from './http'
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 export const MAX_UPLOAD_BYTES = 72 * 1024 * 1024
-export const IMAGE_MODELS = ['gpt-image-2', 'codex-gpt-image-2', 'gpt-image-2.5-sunburst']
-export const accountSource = (model: string) => model === 'gpt-image-2' ? 'web' : 'codex'
+// Each model is served only by accounts of one source: ChatGPT web accounts cannot run Codex models, and vice versa.
+export const MODELS = [
+  { id: 'gpt-image-2', name: 'GPT Image 2', source: 'web', description: '使用 ChatGPT 网页账号生成' },
+  { id: 'codex-gpt-image-2', name: 'GPT Image 2', source: 'codex', description: '使用 Codex 账号生成' },
+  { id: 'gpt-image-2.5-sunburst', name: 'GPT Image 2.5 Sunburst', source: 'codex', description: '使用 Codex 账号生成，quality 额外支持 xhigh、max' },
+] as const satisfies readonly { id: string; name: string; source: 'web' | 'codex'; description: string }[]
+export const IMAGE_MODELS: string[] = MODELS.map(m => m.id)
+export const accountSource = (model: string) => MODELS.find(m => m.id === model)?.source ?? 'codex'
 export const isUploadedReference = (value: string) => /^upload:[a-f0-9]{64}$/.test(value)
 export const referencePath = (value: string) => {
   if (!isUploadedReference(value)) throw new Error('无效的上传图片标识')

@@ -4,13 +4,14 @@ import { toast } from 'sonner'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../ui/dialog'
-import { api, type ApiKey, type Snapshot } from '@/lib/client'
+import { api, preferredModel, type ApiKey, type Snapshot } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { ConfirmDialog, Field, Status, copy, time, type Action } from './shared'
 
 export function Keys({ data, add, action }: { data: Snapshot; add: () => void; action: Action }) {
   const [format, setFormat] = useState<'curl' | 'js'>('curl'), [revoke, setRevoke] = useState<ApiKey | null>(null)
-  const example = format === 'curl' ? `curl ${data.baseUrl}/v1/image-tasks \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: your-order-001" \\\n  -d '{"model":"gpt-image-2","prompt":"极简护肤品广告摄影","n":7}'` : `const task = await fetch('${data.baseUrl}/v1/image-tasks', {\n  method: 'POST',\n  headers: { 'Authorization': 'Bearer YOUR_API_KEY',\n    'Content-Type': 'application/json', 'Idempotency-Key': 'your-order-001' },\n  body: JSON.stringify({ model: 'gpt-image-2', prompt: '极简护肤品广告摄影', n: 7 })\n}).then(res => res.json())`
+  const model = preferredModel(data.models), missingWeb = data.models.some(m => m.source === 'web' && !m.accounts)
+  const example = format === 'curl' ? `curl ${data.baseUrl}/v1/image-tasks \\\n  -H "Authorization: Bearer YOUR_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -H "Idempotency-Key: your-order-001" \\\n  -d '{"model":"${model}","prompt":"极简护肤品广告摄影","n":7}'` : `const task = await fetch('${data.baseUrl}/v1/image-tasks', {\n  method: 'POST',\n  headers: { 'Authorization': 'Bearer YOUR_API_KEY',\n    'Content-Type': 'application/json', 'Idempotency-Key': 'your-order-001' },\n  body: JSON.stringify({ model: '${model}', prompt: '极简护肤品广告摄影', n: 7 })\n}).then(res => res.json())`
   return <div className="space-y-6">
     <section className="panel overflow-hidden">
       <div className="panel-heading"><h2 className="panel-title">业务密钥</h2><span className="text-xs text-muted-foreground">完整密钥只在创建时显示一次</span></div>
@@ -29,6 +30,19 @@ export function Keys({ data, add, action }: { data: Snapshot; add: () => void; a
       </div>}
     </section>
     <section className="panel overflow-hidden">
+      <div className="panel-heading"><h2 className="panel-title">模型列表</h2><span className="text-xs text-muted-foreground">请求中的 model 参数；每个模型只能由对应来源的账号生成</span></div>
+      <div className="overflow-x-auto"><table className="w-full min-w-[640px] text-left text-[13px]">
+        <thead className="bg-surface text-xs text-muted-foreground"><tr>{['模型 ID', '名称', '所需账号', '状态'].map(label => <th key={label} className="px-6 py-3 font-normal">{label}</th>)}</tr></thead>
+        <tbody>{data.models.map(item => <tr key={item.id} className="border-t">
+          <td className="px-6 py-4"><div className="flex items-center gap-1"><code className="font-mono text-[13px]">{item.id}</code><button className="row-action" aria-label={`复制 ${item.id}`} onClick={() => void copy(item.id, '模型 ID 已复制')}><Copy size={13} /></button></div></td>
+          <td className="px-6 py-4"><p>{item.name}</p><p className="mt-1 text-xs text-muted-foreground">{item.description}</p></td>
+          <td className="px-6 py-4"><span className="pill">{item.source === 'codex' ? 'Codex' : 'ChatGPT 网页'}</span></td>
+          <td className="px-6 py-4">{item.accounts ? <span className="pill green"><span className="size-1.5 rounded-full bg-current" />{item.accounts} 个可用账号</span> : <span className="pill amber"><span className="size-1.5 rounded-full bg-current" />无可用账号</span>}</td>
+        </tr>)}</tbody>
+      </table></div>
+      {missingWeb && <p className="border-t px-6 py-3 text-xs leading-6 text-muted-foreground">「授权登录」添加的是 Codex 账号，可使用 codex-gpt-image-2 和 gpt-image-2.5-sunburst；使用 gpt-image-2 需要在「添加账号 → 手动导入」中添加 ChatGPT 网页账号。</p>}
+    </section>
+    <section className="panel overflow-hidden">
       <div className="panel-heading"><h2 className="panel-title">快速接入：提交任务，获取图片地址</h2><span className="pill">JSON API</span></div>
       <div className="grid gap-0 lg:grid-cols-[1fr_300px]">
         <div className="min-w-0 p-6">
@@ -41,6 +55,7 @@ export function Keys({ data, add, action }: { data: Snapshot; add: () => void; a
         </div>
         <div className="space-y-5 border-t bg-surface p-6 lg:border-l lg:border-t-0">
           <div><p className="field-label">接口地址</p><div className="flex items-start gap-1"><code className="break-all text-xs text-soft">{data.baseUrl}/v1</code><button className="row-action -mt-1.5 shrink-0" aria-label="复制接口地址" onClick={() => void copy(`${data.baseUrl}/v1`, '接口地址已复制')}><Copy size={13} /></button></div></div>
+          <div><p className="field-label">模型列表</p><code className="text-xs text-muted-foreground">GET /models</code><p className="field-help">返回模型 ID，available 表示当前是否有可用账号。</p></div>
           <div><p className="field-label">文生图</p><code className="text-xs text-muted-foreground">POST /images/generations</code></div>
           <div><p className="field-label">带参考图生成</p><code className="text-xs text-muted-foreground">POST /images/edits</code><p className="field-help">支持 image 文件上传，或 JSON 中传 image / image_urls 地址数组。OSS 域名需先在设置中允许。</p></div>
           <div><p className="field-label">响应格式</p><p className="text-xs leading-6 text-muted-foreground">编辑接口默认返回 Base64，可指定 response_format=url。异步任务返回 URL。同步接口最多等待 180 秒；超时后请查询 task_id，任务不会自动取消。</p></div>
