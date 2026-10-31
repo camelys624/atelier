@@ -34,10 +34,8 @@ export function SettingsForm({ initial, reload }: { initial: Settings; reload: (
   const usingOss = form.storage === 'oss'
   return <form onSubmit={event => { event.preventDefault(); void persist() }} className="space-y-6">
     <section className="panel">
-      <div className="panel-heading"><div className="flex items-center gap-3"><SlidersHorizontal size={17} className="text-faint" /><h2 className="panel-title">任务调度</h2></div><span className="text-xs text-muted-foreground">单服务实例</span></div>
+      <div className="panel-heading"><div className="flex items-center gap-3"><SlidersHorizontal size={17} className="text-faint" /><h2 className="panel-title">任务调度</h2></div><span className="text-xs text-muted-foreground">并发上限在「账号池」中按账号设置</span></div>
       <div className="grid gap-6 p-6 md:grid-cols-2 xl:grid-cols-3">
-        <Field label="图片总并发" help="所有任务合计同时处理的图片数，1～30。"><Input type="number" min={1} max={30} value={form.globalConcurrency} onChange={e => field('globalConcurrency', Number(e.target.value))} required /></Field>
-        <Field label="单任务图片并发" help="限制单个 7 张任务的占用，让其他任务也能被处理；不能超过总并发。"><Input type="number" min={1} max={Math.min(7, form.globalConcurrency || 7)} value={form.taskConcurrency} onChange={e => field('taskConcurrency', Number(e.target.value))} required /></Field>
         <Field label="队列容量（张）" help="包含排队和处理中的图片；队列满后拒绝新增。"><Input type="number" min={10} max={2000} value={form.queueLimit} onChange={e => field('queueLimit', Number(e.target.value))} required /></Field>
         <Field label="单图超时（秒）" help="60～1800 秒。"><Input type="number" min={60} max={1800} value={form.jobTimeoutSeconds} onChange={e => field('jobTimeoutSeconds', Number(e.target.value))} required /></Field>
         <Field label="账号检查间隔（分钟）" help="1～60 分钟。"><Input type="number" min={1} max={60} value={form.refreshMinutes} onChange={e => field('refreshMinutes', Number(e.target.value))} required /></Field>

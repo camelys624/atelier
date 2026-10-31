@@ -2,6 +2,10 @@
 
 The application owns storage, auth, account scheduling, retries, and OSS uploads.
 Only the ChatGPT wire protocol is retained from basketikun/chatgpt2api.
+
+Single-shot mode reads one JSON request from stdin and prints one result.
+With --worker the process stays alive, reads one {"id", "payload"} line per request,
+runs each request on its own thread and writes {"id", ...result} lines back.
 """
 from __future__ import annotations
 import base64
@@ -10,26 +14,52 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import types
 from curl_cffi.requests.exceptions import RequestException
 
-payload = json.load(sys.stdin)
+WORKER = '--worker' in sys.argv[1:]
+payload = {} if WORKER else json.load(sys.stdin)
 account = payload.get('account', {})
 token = account.get('access_token', '')
 TRANSIENT_CURL_CODES = {5, 6, 7, 18, 28, 35, 52, 55, 56, 92}
+CREDENTIAL_KEYS = ['access_token', 'refresh_token', 'id_token', 'client_id', 'token_endpoint', 'expires_at']
 
 def is_network_error(error):
     return isinstance(error, RequestException) and int(error.code or 0) in TRANSIENT_CURL_CODES
 
-def credential_values():
-    return {key: account[key] for key in ['access_token', 'refresh_token', 'id_token', 'client_id', 'token_endpoint', 'expires_at'] if account.get(key)}
+def credential_values(values=None):
+    values = account if values is None else values
+    return {key: values[key] for key in CREDENTIAL_KEYS if values.get(key)}
 sys.path.insert(0, str(Path(__file__).parent / 'protocol'))
+
+# Requests in a worker share the protocol modules, so per-request state is looked up
+# by access token (accounts) or kept on the request's thread (proxy fallback).
+_local = threading.local()
+_accounts: dict[str, list] = {}
+_accounts_lock = threading.Lock()
+
+def register_account(values):
+    value = values.get('access_token', '')
+    with _accounts_lock:
+        entry = _accounts.setdefault(value, [values, 0])
+        entry[0] = values
+        entry[1] += 1
+    return value
+
+def release_account(value):
+    with _accounts_lock:
+        entry = _accounts.get(value)
+        if entry:
+            entry[1] -= 1
+            if entry[1] <= 0: del _accounts[value]
 
 class RuntimeConfig:
     default_upstream_model_name = 'auto'
     default_thinking_effort = 'auto'
     global_system_prompt = ''
+    # Process-wide: every request carries the same jobTimeoutSeconds setting.
     image_poll_timeout_secs = int(payload.get('timeout', 600))
     image_poll_initial_wait_secs = 3
     image_poll_interval_secs = 5
@@ -40,11 +70,14 @@ class RuntimeConfig:
     image_remove_conversation_after_result = True
     image_remove_conversation_always = False
     log_levels = ['error']
-    def get_proxy_settings(self): return account.get('proxy', '')
+    def get_proxy_settings(self): return (getattr(_local, 'account', None) or account).get('proxy', '')
     def get_proxy_runtime_settings(self): return {'enabled': False, 'egress_mode': 'direct', 'clearance': {'enabled': False}}
 
 class AccountContext:
-    def get_account(self, value): return account if value == token else None
+    def get_account(self, value):
+        with _accounts_lock:
+            entry = _accounts.get(value)
+        return entry[0] if entry else None
     @staticmethod
     def _decode_jwt_payload(value):
         try:
@@ -57,46 +90,57 @@ def module(name, **values):
     item.__dict__.update(values)
     sys.modules[name] = item
 
-module('services.config', config=RuntimeConfig())
+config = RuntimeConfig()
+module('services.config', config=config)
 module('services.account_service', account_service=AccountContext())
 module('services.image_storage_service', image_storage_service=None)
 
-def refreshed_account():
+def refreshed_account(values=None):
     from curl_cffi import requests
-    info = AccountContext._decode_jwt_payload(account.get('access_token', ''))
-    expires_at = int(account.get('expires_at') or info.get('exp') or 0)
-    if account.get('refresh_token') and expires_at < time.time() + 300:
-        kwargs = {'proxy': account['proxy']} if account.get('proxy') else {}
-        token_endpoint = account.get('token_endpoint') or 'https://auth.openai.com/oauth/token'
+    values = account if values is None else values
+    info = AccountContext._decode_jwt_payload(values.get('access_token', ''))
+    expires_at = int(values.get('expires_at') or info.get('exp') or 0)
+    if values.get('refresh_token') and expires_at < time.time() + 300:
+        kwargs = {'proxy': values['proxy']} if values.get('proxy') else {}
+        token_endpoint = values.get('token_endpoint') or 'https://auth.openai.com/oauth/token'
         if token_endpoint not in ('https://auth.openai.com/oauth/token', 'https://auth.openai.com/api/accounts/oauth/token'):
             raise RuntimeError('不支持这个凭证刷新地址')
-        default_client = 'app_EMoamEEZ73f0CkXaXp7hrann' if account.get('source_type') == 'codex' else 'app_2SKx67EdpoN0G6j64rFvigXD'
+        default_client = 'app_EMoamEEZ73f0CkXaXp7hrann' if values.get('source_type') == 'codex' else 'app_2SKx67EdpoN0G6j64rFvigXD'
         response = requests.post(token_endpoint, data={
-            'grant_type': 'refresh_token', 'refresh_token': account['refresh_token'],
-            'client_id': account.get('client_id') or default_client,
+            'grant_type': 'refresh_token', 'refresh_token': values['refresh_token'],
+            'client_id': values.get('client_id') or default_client,
         }, timeout=30, **kwargs)
         if response.status_code != 200:
             raise RuntimeError(f'登录凭证刷新失败（HTTP {response.status_code}），请重新授权账号')
-        values = response.json()
-        if not values.get('access_token'): raise RuntimeError('刷新未返回登录凭证')
+        result = response.json()
+        if not result.get('access_token'): raise RuntimeError('刷新未返回登录凭证')
         for key in ['access_token', 'refresh_token', 'id_token']:
-            if values.get(key): account[key] = values[key]
-        if values.get('expires_in'):
-            account['expires_at'] = int(time.time()) + int(values['expires_in'])
-    return account
+            if result.get(key): values[key] = result[key]
+        if result.get('expires_in'):
+            values['expires_at'] = int(time.time()) + int(result['expires_in'])
+    return values
 
-def execute():
+# Keep the bytes in this process and write one result to the spool; no base64 IPC output.
+def format_result(items, prompt, response_format, base_url=None, created=None, message=''):
+    return {'created': created or int(time.time()), 'data': items}
+
+def execute(request=None):
     global token
-    if payload.get('action') == 'probe':
+    request = payload if request is None else request
+    values = request.get('account') or {}
+    if request.get('action') == 'probe':
         from services.openai_backend_api import OpenAIBackendAPI
         from services.protocol import conversation
         return {'ok': True, 'protocol': 'chatgpt2api', 'commit': '92dd80e'}
-    refreshed_account()
-    token = account['access_token']
+    _local.account = values
+    config.image_poll_timeout_secs = int(request.get('timeout', config.image_poll_timeout_secs))
+    refreshed_account(values)
+    current = register_account(values)
+    if not WORKER: token = current
     from services.openai_backend_api import OpenAIBackendAPI
-    backend = OpenAIBackendAPI(token)
+    backend = OpenAIBackendAPI(current)
     try:
-        if payload.get('action') == 'refresh':
+        if request.get('action') == 'refresh':
             # Only read-only account checks are retried. Never replay image generation.
             for attempt in range(3):
                 try:
@@ -107,43 +151,72 @@ def execute():
                         raise
                     backend.close()
                     time.sleep(0.3 * (attempt + 1))
-                    backend = OpenAIBackendAPI(token)
-            return {'info': info, 'credentials': credential_values()}
+                    backend = OpenAIBackendAPI(current)
+            return {'info': info, 'credentials': credential_values(values)}
         from services.protocol import conversation
-        # Keep the bytes in this process and write one result to the spool; no base64 IPC output.
-        def format_result(items, prompt, response_format, base_url=None, created=None, message=''):
-            return {'created': created or int(time.time()), 'data': items}
         conversation.format_image_result = format_result
-        request = conversation.ConversationRequest(
-            prompt=payload['prompt'], model=payload['model'], n=1,
-            images=payload.get('images') or [], size=payload.get('size') or '1024x1024',
-            quality=payload.get('quality') or 'auto', response_format='b64_json', message_as_error=True,
+        image_request = conversation.ConversationRequest(
+            prompt=request['prompt'], model=request['model'], n=1,
+            images=request.get('images') or [], size=request.get('size') or '1024x1024',
+            quality=request.get('quality') or 'auto', response_format='b64_json', message_as_error=True,
         )
-        source = conversation.stream_codex_image_outputs if account.get('source_type') == 'codex' else conversation.stream_image_outputs
-        for result in source(backend, request):
+        source = conversation.stream_codex_image_outputs if values.get('source_type') == 'codex' else conversation.stream_image_outputs
+        for result in source(backend, image_request):
             if result.kind == 'message': raise RuntimeError('上游未生成图片：' + str(result.text or '')[:200])
             if result.kind != 'result': continue
             for item in result.data:
                 if not item.get('b64_json'): continue
                 raw = base64.b64decode(item['b64_json'], validate=True)
-                target = Path(payload['output'])
+                target = Path(request['output'])
                 temp = target.with_suffix('.part')
                 temp.write_bytes(raw)
                 temp.replace(target)
-                return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png',
-                        'credentials': {key: account[key] for key in ['access_token', 'refresh_token', 'id_token', 'client_id', 'token_endpoint', 'expires_at'] if account.get(key)}}
+                return {'path': str(target), 'bytes': len(raw), 'mime': 'image/png', 'credentials': credential_values(values)}
         raise RuntimeError('上游未返回图片结果')
     finally:
         backend.close()
+        release_account(current)
+        _local.account = None
 
-try:
-    with contextlib.redirect_stdout(sys.stderr): result = execute()
-    print(json.dumps({'ok': True, **result}, ensure_ascii=False))
-except Exception as exc:
-    text = str(exc)
-    for key in ['access_token', 'refresh_token', 'id_token', 'proxy']:
-        if account.get(key): text = text.replace(account[key], '[redacted]')
-    # A token may have rotated before an account check failed. Preserve it through
-    # this private IPC channel so a network failure cannot lose the refresh token.
-    print(json.dumps({'ok': False, 'error': text[:500], 'error_kind': 'network' if is_network_error(exc) else 'upstream', 'credentials': credential_values()}, ensure_ascii=False))
-    sys.exit(1)
+def handle(request):
+    values = request.get('account') or {}
+    try:
+        return {'ok': True, **execute(request)}
+    except Exception as exc:
+        text = str(exc)
+        for key in ['access_token', 'refresh_token', 'id_token', 'proxy']:
+            if values.get(key): text = text.replace(values[key], '[redacted]')
+        # A token may have rotated before an account check failed. Preserve it through
+        # this private IPC channel so a network failure cannot lose the refresh token.
+        return {'ok': False, 'error': text[:500], 'error_kind': 'network' if is_network_error(exc) else 'upstream', 'credentials': credential_values(values)}
+
+def serve(lines, output):
+    lock, threads = threading.Lock(), []
+    def run(line):
+        try: message = json.loads(line)
+        except ValueError: return
+        result = handle(message.get('payload') or {})
+        text = json.dumps({'id': message.get('id'), **result}, ensure_ascii=False)
+        with lock:
+            output.write(text + '\n')
+            output.flush()
+    for line in lines:
+        if not line.strip(): continue
+        thread = threading.Thread(target=run, args=(line,), daemon=True)
+        thread.start()
+        threads.append(thread)
+        threads = [item for item in threads if item.is_alive()]
+    for thread in threads: thread.join()
+
+if WORKER:
+    # Protocol code may print; keep the real stdout exclusively for result lines.
+    channel = os.fdopen(os.dup(sys.stdout.fileno()), 'w', encoding='utf-8')
+    sys.stdout = sys.stderr
+    from services.openai_backend_api import OpenAIBackendAPI
+    from services.protocol import conversation
+    serve(sys.stdin, channel)
+    os._exit(0)
+else:
+    with contextlib.redirect_stdout(sys.stderr): outcome = handle(payload)
+    print(json.dumps(outcome, ensure_ascii=False))
+    if not outcome['ok']: sys.exit(1)

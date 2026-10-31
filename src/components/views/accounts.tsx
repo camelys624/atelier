@@ -1,11 +1,25 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Pause, Play, RefreshCw, Search, ShieldCheck, Trash2, Upload, Users } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
-import type { Account, Snapshot } from '@/lib/client'
+import { MAX_ACCOUNT_SLOTS, type Account, type Snapshot } from '@/lib/client'
 import { ConfirmDialog, Status, Tabs, type Action } from './shared'
 
 type Filter = 'all' | 'web' | 'codex'
+
+function SlotsInput({ account, disabled, save }: { account: Account; disabled: boolean; save: (slots: number) => Promise<unknown> }) {
+  const [draft, setDraft] = useState(String(account.slots)), [editing, setEditing] = useState(false)
+  useEffect(() => { if (!editing) setDraft(String(account.slots)) }, [account.slots, editing])
+  function commit() {
+    setEditing(false)
+    const value = Math.min(MAX_ACCOUNT_SLOTS, Math.max(1, Math.round(Number(draft)) || account.slots))
+    setDraft(String(value))
+    if (value !== account.slots) void save(value)
+  }
+  return <Input type="number" min={1} max={MAX_ACCOUNT_SLOTS} aria-label={`${account.name}的并发上限`} title={`1～${MAX_ACCOUNT_SLOTS}，失焦或回车保存`} className="h-8 w-16 px-2 text-[13px] tabular-nums" value={draft} disabled={disabled}
+    onFocus={() => setEditing(true)} onChange={e => setDraft(e.target.value)} onBlur={commit}
+    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); if (e.key === 'Escape') { setDraft(String(account.slots)); setEditing(false); e.currentTarget.blur() } }} />
+}
 
 export function Accounts({ data, add, action }: { data: Snapshot; add: () => void; action: Action }) {
   const [filter, setFilter] = useState<Filter>('all'), [query, setQuery] = useState(''), [busy, setBusy] = useState<string | null>(null), [remove, setRemove] = useState<Account | null>(null)
@@ -13,7 +27,7 @@ export function Accounts({ data, add, action }: { data: Snapshot; add: () => voi
   const rows = data.accounts.filter(a => (filter === 'all' || a.source === filter) && `${a.name} ${a.email || ''}`.toLowerCase().includes(q))
   async function run(account: Account, path: string, value?: unknown, method?: string, message?: string) { setBusy(account.id); await action(path, value, method, message); setBusy(null) }
   const totalSuccess = data.accounts.reduce((sum, a) => sum + a.success, 0)
-  const stats = [{ label: '已导入账号', value: data.accounts.length }, { label: '可参与调度', value: data.accounts.filter(a => a.status === 'ready').length }, { label: '当前生图占用', value: data.accounts.reduce((sum, a) => sum + a.inflight, 0) }]
+  const stats = [{ label: '已导入账号', value: data.accounts.length }, { label: '可参与调度', value: data.accounts.filter(a => a.status === 'ready').length }, { label: '并发占用 / 总容量', value: `${data.accounts.reduce((sum, a) => sum + a.inflight, 0)} / ${data.accounts.filter(a => a.status === 'ready').reduce((sum, a) => sum + a.slots, 0)}` }]
   return <>
     <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
       {stats.map(item => <div className="panel px-5 py-5" key={item.label}><p className="text-[13px] text-soft">{item.label}</p><p className="mt-2 text-3xl font-medium tabular-nums tracking-tight">{item.value}</p></div>)}
@@ -37,8 +51,8 @@ export function Accounts({ data, add, action }: { data: Snapshot; add: () => voi
               {totalSuccess > 0 && <div className="mt-1.5 flex items-center gap-2"><div className="h-1 w-16 overflow-hidden rounded-full bg-[#eef0e8]"><div className="h-full rounded-full bg-[#91a078]" style={{ width: `${account.success / totalSuccess * 100}%` }} /></div><span className="text-xs text-muted-foreground">{Math.round(account.success / totalSuccess * 100)}%</span></div>}
             </td>
             <td className="px-5 py-4"><div className="flex items-center gap-2">
-              <span className="w-4 text-right tabular-nums text-soft">{account.inflight}</span><span className="text-faint">/</span>
-              <select aria-label={`${account.name}的并发上限`} className="rounded-md border bg-white px-2 py-1 text-[13px] disabled:opacity-50" value={account.slots} disabled={busy === account.id} onChange={e => void run(account, `/api/accounts/${account.id}`, { slots: Number(e.target.value) }, 'PATCH', '并发上限已更新')}>{[1, 2, 3].map(n => <option key={n} value={n}>{n}</option>)}</select>
+              <span className="w-6 text-right tabular-nums text-soft">{account.inflight}</span><span className="text-faint">/</span>
+              <SlotsInput account={account} disabled={busy === account.id} save={slots => run(account, `/api/accounts/${account.id}`, { slots }, 'PATCH', `并发上限已设为 ${slots}`)} />
             </div></td>
             <td className="px-4 py-4"><div className="flex justify-end gap-1">
               <button className="row-action" aria-label={`验证${account.name}`} title="验证与刷新" disabled={working} onClick={() => void run(account, `/api/accounts/${account.id}/refresh`, {}, undefined, '账号验证完成')}><RefreshCw size={15} className={working ? 'animate-spin' : ''} /></button>

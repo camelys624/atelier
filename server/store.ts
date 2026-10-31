@@ -74,11 +74,14 @@ if (!imageColumns.has('queued_at')) {
 export type Account = { id: string; identity: string; name: string; email: string | null; source: 'web' | 'codex'; plan: string; status: string; quota: number | null; slots: number; inflight: number; success: number; fail: number; cooldown_until: number; last_error: string | null; last_refresh: number | null; last_used: number; created: number; secret: string }
 export type Task = { id: string; owner: string; client_id: string | null; fingerprint: string; prompt: string; model: string; size: string; quality: string; n: number; refs: string; demo: number; status: string; created: number; updated: number; error: string | null }
 export type ImageRow = { id: string; task_id: string; position: number; status: string; account_id: string | null; attempts: number; url: string | null; object_key: string | null; local_path: string | null; mime: string | null; bytes: number | null; error: string | null; queued_at: number | null; started: number | null; finished: number | null }
-export type Settings = { globalConcurrency: number; taskConcurrency: number; queueLimit: number; jobTimeoutSeconds: number; refreshMinutes: number; storage: 'local' | 'oss'; publicBaseUrl: string; oss: { region: string; bucket: string; endpoint: string; accessKeyId: string; accessKeySecret: string; prefix: string; urlExpiry: number }; allowedImageHosts: string[] }
-export const defaults: Settings = { globalConcurrency: 10, taskConcurrency: 2, queueLimit: 500, jobTimeoutSeconds: 600, refreshMinutes: 5, storage: 'local', publicBaseUrl: '', oss: { region: '', bucket: '', endpoint: '', accessKeyId: '', accessKeySecret: '', prefix: 'atelier', urlExpiry: 3600 }, allowedImageHosts: [] }
+export type Settings = { queueLimit: number; jobTimeoutSeconds: number; refreshMinutes: number; storage: 'local' | 'oss'; publicBaseUrl: string; oss: { region: string; bucket: string; endpoint: string; accessKeyId: string; accessKeySecret: string; prefix: string; urlExpiry: number }; allowedImageHosts: string[] }
+export const defaults: Settings = { queueLimit: 500, jobTimeoutSeconds: 600, refreshMinutes: 5, storage: 'local', publicBaseUrl: '', oss: { region: '', bucket: '', endpoint: '', accessKeyId: '', accessKeySecret: '', prefix: 'atelier', urlExpiry: 3600 }, allowedImageHosts: [] }
 export function settings(): Settings {
   const row = db.query<{ secret: string }, []>('SELECT secret FROM settings WHERE id=1').get()
-  return row ? unseal(row.secret) : structuredClone(defaults)
+  if (!row) return structuredClone(defaults)
+  // Concurrency is limited per account only; drop the global and per-task limits saved by earlier versions.
+  const { globalConcurrency, taskConcurrency, ...value } = unseal(row.secret)
+  return value
 }
 export function saveSettings(value: Settings) { db.run('INSERT INTO settings(id,secret) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET secret=excluded.secret', [seal(value)]) }
 export function publicSettings() {

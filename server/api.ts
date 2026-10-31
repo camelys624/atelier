@@ -7,7 +7,7 @@ import { normalizeAccount, saveAccount } from './accounts'
 import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
 import { IMAGE_MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
-import { supportsCodexImages } from './account-policy'
+import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
@@ -160,7 +160,7 @@ export async function handleApi(request: Request): Promise<Response> {
         const input = await body(request)
         const status = input.enabled === undefined ? account.status : input.enabled ? 'pending' : 'disabled'
         const name = String(input.name || account.name).slice(0, 80)
-        const slots = integer(input.slots, account.slots, 1, 3)
+        const slots = integer(input.slots, account.slots, 1, MAX_ACCOUNT_SLOTS)
         db.run('UPDATE accounts SET name=?,slots=?,status=? WHERE id=?', [name, slots, status, account.id])
         if (input.enabled) void refreshAccount(account.id).catch(() => {})
         return json({ ok: true })
@@ -178,8 +178,6 @@ export async function handleApi(request: Request): Promise<Response> {
     if (path === '/api/settings' && request.method === 'POST') {
       const input = await body(request), previous = settings()
       const value: Settings = { ...previous,
-        globalConcurrency: integer(input.globalConcurrency, previous.globalConcurrency, 1, 30),
-        taskConcurrency: integer(input.taskConcurrency, previous.taskConcurrency, 1, 7),
         queueLimit: integer(input.queueLimit, previous.queueLimit, 10, 2000),
         jobTimeoutSeconds: integer(input.jobTimeoutSeconds, previous.jobTimeoutSeconds, 60, 1800),
         refreshMinutes: integer(input.refreshMinutes, previous.refreshMinutes, 1, 60),
@@ -187,7 +185,6 @@ export async function handleApi(request: Request): Promise<Response> {
         allowedImageHosts: (Array.isArray(input.allowedImageHosts) ? input.allowedImageHosts : []).map((v: unknown) => String(v).trim().toLowerCase()).filter(Boolean),
         oss: { ...previous.oss, region: String(input.oss?.region || '').trim(), bucket: String(input.oss?.bucket || '').trim(), endpoint: String(input.oss?.endpoint || '').trim(), prefix: String(input.oss?.prefix || 'atelier').trim(), urlExpiry: integer(input.oss?.urlExpiry, previous.oss.urlExpiry, 60, 86400), accessKeyId: input.oss?.accessKeyId && !String(input.oss.accessKeyId).startsWith('****') ? String(input.oss.accessKeyId).trim() : previous.oss.accessKeyId, accessKeySecret: input.oss?.accessKeySecret ? String(input.oss.accessKeySecret).trim() : previous.oss.accessKeySecret },
       }
-      if (value.taskConcurrency > value.globalConcurrency) return bad('单任务并发不能超过总并发')
       if (value.publicBaseUrl && !/^https:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:\/[^\s]*)?$/.test(value.publicBaseUrl)) return bad('图片公开域名需要 HTTPS 地址')
       if (value.oss.endpoint && !/^https:\/\/[A-Za-z0-9.-]+(?::443)?\/?$/.test(value.oss.endpoint)) return bad('OSS Endpoint 需要 HTTPS 域名')
       if (value.storage === 'oss' && (!value.oss.region || !value.oss.bucket || !value.oss.accessKeyId || !value.oss.accessKeySecret)) return bad('使用 OSS 前请补全存储配置')

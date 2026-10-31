@@ -20,6 +20,7 @@ function HourlyBars({ hourly, now }: { hourly: Snapshot['hourly']; now: number }
 export function Overview({ data, online, create, importAccount, openTask, createKey }: { data: Snapshot; online: boolean; create: () => void; importAccount: () => void; openTask: (id: string) => void; createKey: () => void }) {
   const ready = data.accounts.filter(a => a.status === 'ready').length, pending = data.accounts.filter(a => a.status === 'pending').length
   const active = (data.counts.generating || 0) + (data.counts.uploading || 0), queued = data.counts.queued || 0
+  const capacity = data.accounts.filter(a => a.status === 'ready').reduce((sum, a) => sum + a.slots, 0), generating = data.accounts.reduce((sum, a) => sum + a.inflight, 0)
   const delivered = data.delivered.success || 0, finished = delivered + (data.delivered.error || 0), today = data.hourly.reduce((sum, item) => sum + item.count, 0)
   const cards = [
     { title: '可用账号', value: ready, suffix: `/ ${data.accounts.length}`, icon: Users, foot: data.accounts.length ? pending ? `${pending} 个待验证` : '全部已验证' : '还没有导入账号', accent: '#7e8c6b' },
@@ -76,9 +77,9 @@ export function Overview({ data, online, create, importAccount, openTask, create
             <div className="flex items-center"><Cloud size={15} className="mr-2.5 text-faint" /><span className="text-muted-foreground">图片存储</span><Link to="/settings" className="ml-auto text-soft hover:underline">{data.settings.storage === 'oss' ? '阿里云 OSS' : '本地存储'}</Link></div>
             <div className="flex items-center"><Layers2 size={15} className="mr-2.5 text-faint" /><span className="text-muted-foreground">队列占用</span><span className="ml-auto tabular-nums text-soft">{queued + active} <span className="text-muted-foreground">/ {data.settings.queueLimit}</span></span></div>
             <div className="border-t pt-4">
-              <div className="flex justify-between"><span className="text-muted-foreground">图片处理并发</span><span className="tabular-nums text-soft">{active} <span className="text-muted-foreground">/ {data.settings.globalConcurrency}</span></span></div>
-              <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-[#eef0e8]" role="progressbar" aria-label="图片处理并发" aria-valuenow={active} aria-valuemin={0} aria-valuemax={data.settings.globalConcurrency}><div className="h-full rounded-full bg-[#91a078] transition-all" style={{ width: `${Math.min(100, active / data.settings.globalConcurrency * 100)}%` }} /></div>
-              <p className="mt-2.5 text-xs text-muted-foreground">超出并发的图片自动排队处理</p>
+              <div className="flex justify-between"><span className="text-muted-foreground">账号并发占用</span><span className="tabular-nums text-soft">{generating} <span className="text-muted-foreground">/ {capacity}</span></span></div>
+              <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-[#eef0e8]" role="progressbar" aria-label="账号并发占用" aria-valuenow={generating} aria-valuemin={0} aria-valuemax={capacity}><div className="h-full rounded-full bg-[#91a078] transition-all" style={{ width: `${capacity ? Math.min(100, generating / capacity * 100) : 0}%` }} /></div>
+              <p className="mt-2.5 text-xs text-muted-foreground">总容量为可用账号的并发上限之和，超出后自动排队</p>
             </div>
           </div>
         </section>

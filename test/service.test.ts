@@ -18,7 +18,7 @@ const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/devi
 const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
 const { MAX_UPLOAD_BYTES, referencePath, uploadedReference } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
-const { refreshAccount } = await import('../server/adapter')
+const { bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
 const { needsAccountRefresh } = await import('../server/account-policy')
 const { db, defaults, seal, unseal, getTask, taskImages, saveSettings } = store
 const admin = { Authorization: `Bearer ${process.env.ADMIN_KEY}` }
@@ -29,6 +29,20 @@ function account(accountId: string, quota: number | null = 10, slots = 1) {
   db.run("INSERT INTO accounts(id,identity,name,source,plan,status,quota,slots,created,secret) VALUES(?,?,?,'web','Plus','ready',?,?,?,?)", [accountId, accountId, accountId, quota, slots, Date.now(), seal({ access_token: 'test-token-never-sent-to-upstream' })])
 }
 function task(owner = 'admin', n = 7, clientId?: string) { return scheduler.submitTask({ owner, prompt: 'test prompt', model: 'gpt-image-2', n, refs: [], clientId }) }
+// Stands in for adapter/bridge.py in both single-shot and --worker mode, with no network or real credentials.
+function fakeAdapter(path: string, handler: string) {
+  writeFileSync(path, `#!${process.execPath}
+const handle = async p => { ${handler} }
+if (process.argv.includes('--worker')) {
+  const decoder = new TextDecoder(); let buffer = ''
+  for await (const chunk of Bun.stdin.stream()) {
+    buffer += decoder.decode(chunk, { stream: true })
+    for (let end = buffer.indexOf('\\n'); end >= 0; end = buffer.indexOf('\\n')) { const m = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1); void handle(m.payload).then(r => console.log(JSON.stringify({ id: m.id, ...r }))) }
+  }
+} else console.log(JSON.stringify(await handle(await new Response(Bun.stdin).json())))
+`)
+  chmodSync(path, 0o700); stopAdapters()
+}
 async function waitFor(check: () => boolean, timeout = 10_000) { const deadline = Date.now() + timeout; while (!check()) { if (Date.now() > deadline) throw new Error('Timed out'); await Bun.sleep(25) } }
 beforeEach(() => { db.exec('DELETE FROM images; DELETE FROM tasks; DELETE FROM accounts; DELETE FROM api_keys; DELETE FROM sessions; DELETE FROM settings; DELETE FROM device_authorizations;'); saveSettings(structuredClone(defaults)) })
 afterAll(() => { db.close(); rmSync(temporary, { recursive: true, force: true }) })
@@ -43,10 +57,9 @@ describe('image edit SDK compatibility', () => {
   }
   const edit = (body: FormData, headers: Record<string, string> = admin) => handleApi(new Request('http://127.0.0.1:3080/v1/images/edits', { method: 'POST', headers, body }))
   test('accepts real multipart uploads, preserves order/settings, returns PNG base64 and reuses identical retries', async () => {
-    // A separate executable stands in for the upstream protocol, with no network or real credentials.
     const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-image-adapter'), capture = join(temporary, 'adapter-request.json')
-    writeFileSync(fake, `#!${process.execPath}\nconst p=await new Response(Bun.stdin).json(); await Bun.write(${JSON.stringify(capture)},JSON.stringify(p)); await Bun.write(p.output,Buffer.from(${JSON.stringify(png.toString('base64'))},'base64')); console.log(JSON.stringify({ok:true,mime:'image/png',bytes:${png.length}}));\n`)
-    chmodSync(fake, 0o700); process.env.PYTHON_BIN = fake
+    fakeAdapter(fake, `await Bun.write(${JSON.stringify(capture)},JSON.stringify(p)); await Bun.write(p.output,Buffer.from(${JSON.stringify(png.toString('base64'))},'base64')); return {ok:true,mime:'image/png',bytes:${png.length}}`)
+    process.env.PYTHON_BIN = fake
     account('codex-sdk'); db.run("UPDATE accounts SET source='codex',plan='prolite' WHERE id='codex-sdk'")
     const refs = [new Blob([png]), new Blob([png, 'second']), new Blob([png, 'third'])]
     try {
@@ -72,7 +85,7 @@ describe('image edit SDK compatibility', () => {
       const urlValue = await url.json()
       expect(url.status).toBe(200); expect(urlValue.data[0].url).toContain('/media/'); expect(urlValue.data[0].b64_json).toBeUndefined()
       expect(db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM tasks').get()!.n).toBe(1)
-    } finally { if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+    } finally { stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
   })
   test('accepts singular image and parsed form booleans; stores references for queued retries', async () => {
     const response = await edit(form({ async: 'true', demo: 'true', stream: 'false' }, undefined, 'image'))
@@ -129,10 +142,7 @@ describe('account validation network failures', () => {
   test('preserves rotated tokens, schedules a short network retry, then recovers without reimporting', async () => {
     account('transient-network')
     const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-validation-adapter')
-    const configure = (result: unknown) => {
-      writeFileSync(fake, `#!${process.execPath}\nconsole.log(${JSON.stringify(JSON.stringify(result))});\n`)
-      chmodSync(fake, 0o700)
-    }
+    const configure = (result: unknown) => fakeAdapter(fake, `return ${JSON.stringify(result)}`)
     process.env.PYTHON_BIN = fake
     try {
       configure({ ok: false, error_kind: 'network', error: 'curl: (35) TLS connect error', credentials: { access_token: 'rotated-after-refresh', refresh_token: 'new-refresh-token' } })
@@ -146,7 +156,7 @@ describe('account validation network failures', () => {
       await refreshAccount('transient-network')
       const recovered = store.getAccount('transient-network')!
       expect(recovered.status).toBe('ready'); expect(recovered.last_error).toBeNull(); expect(recovered.cooldown_until).toBe(0)
-    } finally { if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+    } finally { stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
   })
   test('does not retry an invalid credential or a disabled/busy account on the short network schedule', () => {
     const now = Date.now(), base = { status: 'error', inflight: 0, last_refresh: now, cooldown_until: 0 }
@@ -345,18 +355,27 @@ describe('durable queue and resource reservations', () => {
     expect(taskImages(first.id)).toHaveLength(7)
     expect(() => scheduler.submitTask({ owner: 'admin', prompt: 'different', n: 7, model: 'gpt-image-2', refs: [], clientId: 'order-001' })).toThrow('幂等')
   })
-  test('enforces global, per-task and per-account concurrency', () => {
-    saveSettings({ ...defaults, globalConcurrency: 3, taskConcurrency: 2 })
-    account('a', 10, 1); account('b', 10, 1); account('c', 10, 1); account('d', 10, 1)
-    const first = task(), second = task()
-    expect(scheduler.claimImage()!.task.id).toBe(first.id)
-    expect(scheduler.claimImage()!.task.id).toBe(first.id)
-    expect(scheduler.claimImage()!.task.id).toBe(second.id)
+  test('limits concurrency only by account slots, so one task can use every free slot', () => {
+    account('a', 10, 2); account('b', 10, 1)
+    const first = task(); task()
+    for (let i = 0; i < 3; i++) expect(scheduler.claimImage()!.task.id).toBe(first.id)
     expect(scheduler.claimImage()).toBeNull()
     expect(store.accounts().reduce((sum, a) => sum + a.inflight, 0)).toBe(3)
   })
+  test('accepts up to 30 slots per account and clamps larger values', async () => {
+    account('a')
+    expect((await request('/api/accounts/a', { slots: 30 }, admin, 'PATCH')).status).toBe(200)
+    expect(store.getAccount('a')!.slots).toBe(30)
+    await request('/api/accounts/a', { slots: 45 }, admin, 'PATCH')
+    expect(store.getAccount('a')!.slots).toBe(30)
+  })
+  test('ignores global and per-task limits saved by earlier versions', () => {
+    saveSettings({ ...defaults, globalConcurrency: 1, taskConcurrency: 1 } as typeof defaults)
+    expect(store.settings()).not.toHaveProperty('globalConcurrency')
+    account('a', 10, 3); task()
+    expect([1, 2, 3].map(() => scheduler.claimImage()).every(Boolean)).toBe(true)
+  })
   test('spreads images across accounts before stacking a second image on any of them', () => {
-    saveSettings({ ...defaults, globalConcurrency: 10, taskConcurrency: 7 })
     account('a', 10, 3); account('b', 10, 3); account('c', 10, 3); task()
     const first = [1, 2, 3].map(() => scheduler.claimImage()!.account!.id)
     expect(new Set(first).size).toBe(3)
@@ -365,14 +384,12 @@ describe('durable queue and resource reservations', () => {
     expect(store.accounts().map(a => a.inflight)).toEqual([2, 2, 2])
   })
   test('prefers an idle account over a busy one that was used less recently', () => {
-    saveSettings({ ...defaults, globalConcurrency: 10, taskConcurrency: 7 })
     account('busy', 10, 3); account('idle', 10, 3)
     db.run("UPDATE accounts SET inflight=1,last_used=1 WHERE id='busy'"); db.run(`UPDATE accounts SET inflight=0,last_used=${Date.now()} WHERE id='idle'`)
     task()
     expect(scheduler.claimImage()!.account!.id).toBe('idle')
   })
   test('balances by load ratio so a small account is not kept at its limit', () => {
-    saveSettings({ ...defaults, globalConcurrency: 10, taskConcurrency: 7 })
     account('large', 10, 3); account('small', 10, 1)
     db.run("UPDATE accounts SET inflight=1,last_used=1 WHERE id='large'"); db.run("UPDATE accounts SET inflight=0,last_used=2 WHERE id='small'")
     task()
@@ -380,7 +397,6 @@ describe('durable queue and resource reservations', () => {
     expect(scheduler.claimImage()!.account!.id).toBe('large')
   })
   test('reserves quota so a one-image balance cannot accept three images', () => {
-    saveSettings({ ...defaults, globalConcurrency: 10, taskConcurrency: 7 })
     account('a', 1, 3); task()
     expect(scheduler.claimImage()).not.toBeNull()
     expect(scheduler.claimImage()).toBeNull()
@@ -461,4 +477,39 @@ describe('durable queue and resource reservations', () => {
     saveSettings({ ...defaults, allowedImageHosts: ['127.0.0.1'] })
     await expect(validateImageUrl('https://127.0.0.1/image.png')).rejects.toThrow('私有网络')
   })
+})
+describe('adapter worker pool', () => {
+  const fake = join(temporary, 'fake-pool-adapter')
+  async function withAdapter(handler: string, env: Record<string, string>, run: () => Promise<void>) {
+    const saved = Object.fromEntries(['PYTHON_BIN', 'ADAPTER_WORKERS', 'ADAPTER_POOL'].map(key => [key, process.env[key]]))
+    fakeAdapter(fake, handler)
+    Object.assign(process.env, { PYTHON_BIN: fake, ...env })
+    try { await run() } finally {
+      stopAdapters()
+      for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value
+    }
+  }
+  const echo = 'await Bun.sleep(p.delay || 0); if (p.crash) process.exit(1); return { ok: true, echo: p.echo, pid: process.pid }'
+  test('runs concurrent requests in one long-lived worker and matches results by id', () => withAdapter(echo, { ADAPTER_WORKERS: '1' }, async () => {
+    const results = await Promise.all([['a', 150], ['b', 20], ['c', 80]].map(([value, delay]) => bridge({ echo: value, delay }, 60)))
+    expect(results.map(r => r.echo)).toEqual(['a', 'b', 'c'])
+    expect(new Set(results.map(r => r.pid)).size).toBe(1)
+    expect((await bridge({ echo: 'd' }, 60)).pid).toBe(results[0].pid)
+    expect(adapterStats().workers).toHaveLength(1)
+  }))
+  test('spreads concurrent requests over at most ADAPTER_WORKERS processes', () => withAdapter(echo, { ADAPTER_WORKERS: '2' }, async () => {
+    const results = await Promise.all([1, 2, 3, 4, 5].map(() => bridge({ delay: 100 }, 60)))
+    expect(new Set(results.map(r => r.pid)).size).toBe(2)
+  }))
+  test('fails the requests of a worker that exits, then starts a new one', () => withAdapter(echo, { ADAPTER_WORKERS: '1' }, async () => {
+    const first = await bridge({}, 60)
+    const errors = await Promise.all([bridge({ delay: 300 }, 60), bridge({ crash: true, delay: 50 }, 60)].map(request => request.then(() => '', (error: Error) => error.message)))
+    expect(errors.every(message => message.includes('进程已退出'))).toBe(true)
+    expect((await bridge({}, 60)).pid).not.toBe(first.pid)
+  }))
+  test('ADAPTER_POOL=0 starts one process per request', () => withAdapter(echo, { ADAPTER_POOL: '0' }, async () => {
+    const [a, b] = await Promise.all([bridge({ delay: 50 }, 60), bridge({ delay: 50 }, 60)])
+    expect(a.pid).not.toBe(b.pid)
+    expect(adapterStats().workers).toHaveLength(0)
+  }))
 })

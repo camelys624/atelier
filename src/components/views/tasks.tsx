@@ -66,7 +66,8 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
   const anyReady = data.accounts.some(a => a.status === 'ready')
   const [prompt, setPrompt] = useState(''), [model, setModel] = useState('gpt-image-2'), [n, setN] = useState(7), [urls, setUrls] = useState(''), [demo, setDemo] = useState(!anyReady), [busy, setBusy] = useState(false)
   useEffect(() => { if (open && !anyReady) setDemo(true) }, [open])
-  const source = model === 'gpt-image-2' ? 'web' : 'codex', usable = data.accounts.filter(a => a.source === source && a.status === 'ready').length
+  const source = model === 'gpt-image-2' ? 'web' : 'codex', ready = data.accounts.filter(a => a.source === source && a.status === 'ready'), usable = ready.length
+  const free = ready.reduce((sum, a) => sum + Math.max(0, a.slots - a.inflight), 0)
   const refs = urls.split(/\s+/).filter(Boolean), tooMany = !demo && refs.length > 7
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -95,7 +96,7 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
         <div><p className="text-[13px] font-medium text-[#6f5c3d]">本地演示模式</p><p className="mt-1.5 text-xs leading-5 text-[#7d6c50]">生成固定的示例预览，用于测试队列和结果查看。不调用 ChatGPT，不消耗账号额度，也不验证 OSS 链路。</p></div>
       </label>
       <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-5">
-        <span className="text-xs text-muted-foreground">{n} 张图片 · 最多 {Math.min(n, data.settings.taskConcurrency)} 张同时处理</span>
+        <span className="text-xs text-muted-foreground">{n} 张图片{!demo && usable > 0 && ` · 当前空闲并发 ${free}，${free >= n ? '可全部立即开始' : free ? `${free} 张立即开始，其余排队` : '全部排队等待'}`}</span>
         <Button disabled={busy || !prompt.trim() || tooMany} type="submit">{busy ? <Loader2 className="animate-spin" /> : <Sparkles />}{demo ? '创建演示任务' : '提交生图任务'}</Button>
       </div>
     </form>

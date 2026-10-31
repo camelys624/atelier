@@ -1,4 +1,4 @@
-import io,json,runpy,contextlib,unittest,base64,tempfile,os,threading,time
+import io,json,runpy,contextlib,unittest,base64,tempfile,os,threading,time,sys
 from pathlib import Path
 from unittest.mock import patch,Mock
 
@@ -166,6 +166,53 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend._get_default_account = sibling
         with self.assertRaises(RequestException): backend.get_user_info()
         self.assertEqual(len(finished), 2)
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        with patch('sys.stdin', io.StringIO(json.dumps({'action': 'probe'}))), contextlib.redirect_stdout(io.StringIO()):
+            self.ctx = runpy.run_path(str(Path(__file__).with_name('bridge.py')))
+
+    def serve(self, requests, factory):
+        from services import openai_backend_api
+        lines = ''.join(json.dumps({'id': index, 'payload': request}) + '\n' for index, request in enumerate(requests))
+        output = io.StringIO()
+        with patch.object(openai_backend_api, 'OpenAIBackendAPI', side_effect=factory):
+            self.ctx['serve'](io.StringIO(lines), output)
+        return {item['id']: item for item in map(json.loads, output.getvalue().splitlines())}
+
+    def test_runs_requests_concurrently_and_keeps_accounts_apart(self):
+        barrier, seen = threading.Barrier(2, timeout=5), {}
+        def factory(token):
+            # Both requests must be in flight at once, or the barrier times out.
+            seen[token] = sys.modules['services.account_service'].account_service.get_account(token)['email']
+            backend = Mock()
+            def events(**_):
+                barrier.wait()
+                return iter([{'type': 'image_generation_call', 'result': base64.b64encode(token.encode()).decode()}])
+            backend.iter_codex_image_response_events.side_effect = events
+            return backend
+        with tempfile.TemporaryDirectory() as directory:
+            requests = [{'action': 'generate', 'account': {'source_type': 'codex', 'access_token': f'token-{name}', 'email': f'{name}@example.com'}, 'prompt': name, 'model': 'codex-gpt-image-2', 'output': str(Path(directory) / f'{name}.png')} for name in ['a', 'b']]
+            results = self.serve(requests, factory)
+            for index, name in enumerate(['a', 'b']):
+                self.assertTrue(results[index]['ok'], results[index])
+                self.assertEqual(results[index]['credentials']['access_token'], f'token-{name}')
+                self.assertEqual((Path(directory) / f'{name}.png').read_bytes(), f'token-{name}'.encode())
+        self.assertEqual(seen, {'token-a': 'a@example.com', 'token-b': 'b@example.com'})
+        self.assertEqual(self.ctx['_accounts'], {})
+
+    def test_one_failed_request_does_not_affect_another(self):
+        def factory(token):
+            backend = Mock()
+            if token == 'token-bad': backend.iter_codex_image_response_events.side_effect = RuntimeError('upstream rejected token-bad')
+            else: backend.iter_codex_image_response_events.return_value = iter([{'type': 'image_generation_call', 'result': 'b2s='}])
+            return backend
+        with tempfile.TemporaryDirectory() as directory:
+            requests = [{'action': 'generate', 'account': {'source_type': 'codex', 'access_token': f'token-{name}'}, 'prompt': name, 'model': 'codex-gpt-image-2', 'output': str(Path(directory) / f'{name}.png')} for name in ['bad', 'good']]
+            results = self.serve(requests, factory)
+        self.assertFalse(results[0]['ok'])
+        self.assertNotIn('token-bad', results[0]['error'])
+        self.assertTrue(results[1]['ok'])
 
 if __name__ == '__main__':
     unittest.main()
