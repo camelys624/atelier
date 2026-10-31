@@ -214,5 +214,54 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn('token-bad', results[0]['error'])
         self.assertTrue(results[1]['ok'])
 
+    def test_each_request_keeps_its_own_timeout(self):
+        config = sys.modules['services.config'].config
+        second_started, seen = threading.Event(), {}
+        def factory(token):
+            backend = Mock()
+            def events(**_):
+                # The first request reads its timeout only after the second one has started.
+                if token == 'token-first': second_started.wait(5)
+                else: second_started.set()
+                seen[token] = config.image_poll_timeout_secs
+                return iter([{'type': 'image_generation_call', 'result': 'b2s='}])
+            backend.iter_codex_image_response_events.side_effect = events
+            return backend
+        with tempfile.TemporaryDirectory() as directory:
+            requests = [{'action': 'generate', 'timeout': timeout, 'account': {'source_type': 'codex', 'access_token': f'token-{name}'}, 'prompt': name, 'model': 'codex-gpt-image-2', 'output': str(Path(directory) / f'{name}.png')} for name, timeout in [('first', 600), ('second', 60)]]
+            self.serve(requests, factory)
+        self.assertEqual(seen, {'token-first': 600, 'token-second': 60})
+
+    def test_idle_worker_does_not_keep_the_previous_request(self):
+        import gc, tracemalloc
+        tracemalloc.start()
+        try:
+            box, held = [json.dumps({'id': 0, 'payload': {'action': 'probe', 'images': ['data:image/png;base64,' + 'A' * (8 * 1024 * 1024)]}}) + '\n'], []
+            def lines():
+                yield box.pop()
+                time.sleep(0.3); gc.collect()
+                held.append(tracemalloc.get_traced_memory()[0])  # request finished, worker waiting for the next line
+            self.ctx['serve'](lines(), io.StringIO())
+        finally: tracemalloc.stop()
+        self.assertLess(held[0], 4 * 1024 * 1024)
+
+    def test_codex_reference_files_are_sent_inline_and_web_keeps_paths(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'pixels'
+        captured = {}
+        def factory(token):
+            backend = Mock()
+            def events(**kwargs):
+                captured['images'] = kwargs['images']
+                return iter([{'type': 'image_generation_call', 'result': 'b2s='}])
+            backend.iter_codex_image_response_events.side_effect = events
+            return backend
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / 'reference'
+            reference.write_bytes(png)
+            results = self.serve([{'action': 'generate', 'account': {'source_type': 'codex', 'access_token': 'token'}, 'prompt': 'x', 'model': 'codex-gpt-image-2', 'images': [str(reference), 'data:image/png;base64,abc'], 'output': str(Path(directory) / 'out.png')}], factory)
+            self.assertTrue(results[0]['ok'], results[0])
+            self.assertEqual(captured['images'], ['data:image/png;base64,' + base64.b64encode(png).decode(), 'data:image/png;base64,abc'])
+            self.assertEqual(self.ctx['reference_image'](str(reference), False), str(reference))
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,15 +1,18 @@
 import { mkdirSync } from 'node:fs'
+import { unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { db, dataDir, settings, accounts, getAccount, getTask, taskImages, id, hash, type Account, type ImageRow, type Task } from './store'
-import { generateImage, refreshAccount, safeError } from './adapter'
+import { AdapterTimeoutError, generateImage, refreshAccount, safeError } from './adapter'
 import { fetchReference } from './network'
 import { persistImage, cleanupUploadedFile } from './storage'
-import { accountSource, isUploadedReference, uploadedReference } from './image-input'
+import { accountSource, isUploadedReference, uploadedReferenceFile } from './image-input'
 import { CODEX_IMAGE_PLANS, needsAccountRefresh } from './account-policy'
 
 mkdirSync(resolve(dataDir, 'spool'), { recursive: true, mode: 0o700 })
 const running = new Set<string>()
 const refreshing = new Set<string>()
+// Images whose timed-out attempt may still be running upstream; they cannot be retried until it ends.
+const settling = new Set<string>()
 let timer: ReturnType<typeof setInterval> | undefined
 let stopped = false
 export const baseUrl = () => (process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 3080}`).replace(/\/$/, '')
@@ -63,7 +66,7 @@ export function claimImage(): { image: ImageRow; task: Task; account: Account | 
       }
       db.run("UPDATE images SET status='generating',account_id=?,attempts=attempts+1,started=?,error=NULL WHERE id=?", [account?.id || null, Date.now(), image.id])
       db.run("UPDATE tasks SET status='running',updated=? WHERE id=?", [Date.now(), task.id])
-      return { image: { ...image, status: 'generating' }, task, account }
+      return { image: { ...image, status: 'generating', attempts: image.attempts + 1 }, task, account }
     }
     return null
   }).immediate()
@@ -87,11 +90,18 @@ async function upload(imageId: string) {
 }
 async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
   const { image, account, task } = job
-  let slotReleased = false
+  let slotReleased = false, attemptEnded: Promise<unknown> = Promise.resolve()
+  // Reference images go to the adapter as file paths; URL references are downloaded to the spool for this attempt.
+  const refs: string[] = [], downloaded: string[] = []
   try {
-    const refs: string[] = []
-    if (!task.demo) for (const reference of JSON.parse(task.refs)) refs.push(await (isUploadedReference(reference) ? uploadedReference(reference) : fetchReference(reference)))
-    const result = task.demo ? await demoImage(image.id, image.position) : await generateImage(account!, { prompt: task.prompt, model: task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id })
+    if (!task.demo) for (const [index, reference] of (JSON.parse(task.refs) as string[]).entries()) {
+      if (isUploadedReference(reference)) { refs.push(await uploadedReferenceFile(reference)); continue }
+      const path = resolve(dataDir, 'spool', `${image.id}.${image.attempts}.ref${index}`)
+      downloaded.push(path)
+      await Bun.write(path, await fetchReference(reference))
+      refs.push(path)
+    }
+    const result = task.demo ? await demoImage(image.id, image.position) : await generateImage(account!, { prompt: task.prompt, model: task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts })
     db.transaction(() => {
       db.run("UPDATE images SET status='uploading',local_path=?,mime=?,bytes=? WHERE id=?", [result.path, result.mime, result.bytes, image.id])
       if (account) db.run("UPDATE accounts SET inflight=MAX(0,inflight-1),success=success+1,quota=CASE WHEN quota IS NULL THEN NULL ELSE MAX(0,quota-1) END,status=CASE WHEN status='disabled' THEN 'disabled' WHEN quota=1 THEN 'limited' ELSE status END WHERE id=?", [account.id])
@@ -101,8 +111,16 @@ async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
   } catch (error) {
     const message = safeError(error)
     db.run("UPDATE images SET status='error',error=?,finished=? WHERE id=?", [message, Date.now(), image.id])
-    if (account && !slotReleased) db.run('UPDATE accounts SET inflight=MAX(0,inflight-1),fail=fail+1,cooldown_until=?,last_error=? WHERE id=?', [Date.now() + 60_000, message, account.id])
+    const timedOut = error instanceof AdapterTimeoutError
+    if (account && !slotReleased) db.run(`UPDATE accounts SET fail=fail+1,cooldown_until=?,last_error=?${timedOut ? '' : ',inflight=MAX(0,inflight-1)'} WHERE id=?`, [Date.now() + 60_000, message, account.id])
+    if (timedOut) {
+      // The attempt may still be generating upstream: keep its account slot and block retries until the adapter lets it go.
+      attemptEnded = error.settled
+      settling.add(image.id)
+      void error.settled.then(() => { settling.delete(image.id); if (account) db.run('UPDATE accounts SET inflight=MAX(0,inflight-1) WHERE id=?', [account.id]); void pump() })
+    }
   } finally {
+    void attemptEnded.then(() => Promise.all(downloaded.map(path => unlink(path).catch(() => {}))))
     running.delete(image.id)
     updateTaskStatus(task.id)
     void pump()
@@ -130,6 +148,7 @@ export async function pump() {
 export function retryTask(taskId: string) {
   if (getTask(taskId)?.status === 'cancelled') throw new Error('已取消的任务无法重试，请新建任务')
   const failed = taskImages(taskId).filter(i => i.status === 'error')
+  if (failed.some(i => settling.has(i.id))) throw new Error('有图片的上一次尝试超时后仍在结束中，请稍后再重试，避免重复生成')
   const count = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM images WHERE status IN ('queued','generating','uploading')").get()!.count
   if (count + failed.length > settings().queueLimit) throw new Error('队列已满')
   const now = Date.now()

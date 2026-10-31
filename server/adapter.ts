@@ -1,15 +1,21 @@
+import { unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { dataDir, getAccount, seal, settings, unseal, db, type Account } from './store'
 
 const children = new Set<ReturnType<typeof Bun.spawn>>()
 class AdapterError extends Error { constructor(message: string, public kind: string) { super(message) } }
 const NO_RESULT = '上游适配器未返回结果，请检查 Python 依赖或任务超时设置'
+const EXITED = '上游适配器进程已退出，请检查 Python 依赖后重试'
+// Extra wait beyond the job timeout before giving up on a request; ADAPTER_TIMEOUT_GRACE_MS only shortens it in tests.
+const graceMs = () => Number(process.env.ADAPTER_TIMEOUT_GRACE_MS) || 15_000
+/** A request that ran past its timeout. `settled` resolves once the worker has finished or dropped it; until then it may still be running upstream. */
+export class AdapterTimeoutError extends Error { constructor(message: string, public settled: Promise<void>) { super(message) } }
 const command = (...args: string[]) => [process.env.PYTHON_BIN || 'python3', resolve('adapter/bridge.py'), ...args]
 const pythonEnv = () => ({ ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONUNBUFFERED: '1' })
 
 // Each Python process costs ~50 MB before doing any work, and a request mostly waits on upstream.
 // A few long-lived workers run requests on threads instead; ADAPTER_POOL=0 restores one process per request.
-type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
+type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; payload: Record<string, unknown>; abandoned?: () => void }
 type Worker = { child: Bun.Subprocess<'pipe', 'pipe', 'ignore'>; pending: Map<number, Pending>; draining: boolean }
 const workers = new Set<Worker>()
 let nextRequest = 0
@@ -23,7 +29,13 @@ export function stopAdapters() {
 export function adapterStats() {
   return { mode: process.env.ADAPTER_POOL === '0' ? 'process-per-request' : 'pool', workers: [...workers].map(w => ({ pid: w.child.pid, pending: w.pending.size, draining: w.draining })) }
 }
-function retire(worker: Worker) { if (worker.draining && !worker.pending.size) worker.child.kill('SIGTERM') }
+// Once a draining worker only holds timed-out requests, stop it: that ends those threads instead of letting them finish upstream.
+function retire(worker: Worker) { if (worker.draining && [...worker.pending.values()].every(request => request.abandoned)) worker.child.kill('SIGTERM') }
+function settleLate(request: Pending, message: any) {
+  // The caller already gave up on this result, but a rotated token must still be kept.
+  if (typeof request.payload.accountId === 'string') updateCredentials(request.payload.accountId, message.credentials)
+  request.abandoned!()
+}
 function startWorker() {
   const child = Bun.spawn(command('--worker'), { stdin: 'pipe', stdout: 'pipe', stderr: 'ignore', env: pythonEnv() })
   const worker: Worker = { child, pending: new Map(), draining: false }
@@ -40,14 +52,15 @@ function startWorker() {
         try { message = JSON.parse(line) } catch { continue }
         const request = worker.pending.get(message.id)
         if (!request) continue
-        worker.pending.delete(message.id); clearTimeout(request.timer); request.resolve(message)
+        worker.pending.delete(message.id); clearTimeout(request.timer)
+        if (request.abandoned) settleLate(request, message); else request.resolve(message)
       }
       retire(worker)
     }
   })().catch(() => {}).finally(() => {
     // stdout closes when the process exits: fail whatever it still owed.
     workers.delete(worker)
-    for (const request of worker.pending.values()) { clearTimeout(request.timer); request.reject(new Error('上游适配器进程已退出，请检查 Python 依赖后重试')) }
+    for (const request of worker.pending.values()) { clearTimeout(request.timer); if (request.abandoned) request.abandoned(); else request.reject(new Error(EXITED)) }
     worker.pending.clear()
   })
   return worker
@@ -64,20 +77,22 @@ function pickWorker() {
 function pooled(payload: Record<string, unknown>, timeoutSeconds: number): Promise<any> {
   const worker = pickWorker(), id = ++nextRequest
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      worker.pending.delete(id)
-      // A Python thread cannot be cancelled: stop routing work to this process and recycle it once its other requests finish.
-      worker.draining = true; retire(worker)
-      reject(new Error(NO_RESULT))
-    }, (timeoutSeconds + 15) * 1000)
-    worker.pending.set(id, { resolve, reject, timer })
+    const request: Pending = { resolve, reject, payload, timer: setTimeout(() => {
+      // A Python thread cannot be cancelled. Keep tracking the request so callers can hold its resources until it really ends,
+      // and stop routing work to this process so it is recycled as soon as its other requests finish.
+      const settled = new Promise<void>(done => { request.abandoned = done })
+      worker.draining = true
+      reject(new AdapterTimeoutError(`生成超过 ${timeoutSeconds} 秒未返回结果，已判为失败；上游可能仍在处理，结束前不能重试`, settled))
+      retire(worker)
+    }, timeoutSeconds * 1000 + graceMs()) }
+    worker.pending.set(id, request)
     try { worker.child.stdin.write(JSON.stringify({ id, payload }) + '\n'); void worker.child.stdin.flush() }
-    catch { worker.pending.delete(id); clearTimeout(timer); reject(new Error('上游适配器进程已退出，请检查 Python 依赖后重试')) }
+    catch { worker.pending.delete(id); clearTimeout(request.timer); reject(new Error(EXITED)) }
   })
 }
 async function spawned(payload: Record<string, unknown>, timeoutSeconds: number) {
   const child = Bun.spawn(command(), { stdin: new Blob([JSON.stringify(payload)]), stdout: 'pipe', stderr: 'ignore', env: pythonEnv() })
-  const timer = setTimeout(() => child.kill('SIGKILL'), (timeoutSeconds + 15) * 1000)
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutSeconds * 1000 + graceMs())
   children.add(child)
   try {
     const [raw] = await Promise.all([new Response(child.stdout).text(), child.exited])
@@ -127,9 +142,16 @@ export async function refreshAccount(accountId: string) {
 export function safeError(error: unknown) {
   return String(error instanceof Error ? error.message : error).replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/eyJ[A-Za-z0-9_.-]{30,}/g, '[redacted]').replace(/https?:\/\/[^\s]+/g, '[upstream]').slice(0, 350)
 }
-export async function generateImage(account: Account, request: { prompt: string; model: string; size: string; quality: string; images: string[]; imageId: string }) {
-  const output = resolve(dataDir, 'spool', `${request.imageId}.png`)
-  const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
-  updateCredentials(account.id, result.credentials)
-  return { path: output, mime: result.mime || 'image/png', bytes: result.bytes }
+export async function generateImage(account: Account, request: { prompt: string; model: string; size: string; quality: string; images: string[]; imageId: string; attempt: number }) {
+  // Each attempt writes its own file, so a timed-out attempt that finishes late can never overwrite a retry.
+  const output = resolve(dataDir, 'spool', `${request.imageId}.${request.attempt}.png`)
+  const discard = () => Promise.all([output, output.replace(/\.png$/, '.part')].map(path => unlink(path).catch(() => {})))
+  try {
+    const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
+    updateCredentials(account.id, result.credentials)
+    return { path: output, mime: result.mime || 'image/png', bytes: result.bytes }
+  } catch (error) {
+    void (error instanceof AdapterTimeoutError ? error.settled.then(discard) : discard())
+    throw error
+  }
 }

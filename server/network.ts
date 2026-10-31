@@ -42,5 +42,5 @@ export async function fetchReference(value: string) {
     }
   } finally { await reader.cancel().catch(() => {}) }
   if (!size) throw new Error('参考图内容为空')
-  return `data:${type};base64,${Buffer.concat(chunks).toString('base64')}`
+  return Buffer.concat(chunks)
 }
