@@ -50,18 +50,14 @@ export function submitTask(input: TaskInput) {
 }
 export function claimImage(): { image: ImageRow; task: Task; account: Account | null } | null {
   return db.transaction(() => {
-    const options = settings()
-    const active = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM images WHERE status IN ('generating','uploading')").get()!.count
-    if (active >= options.globalConcurrency) return null
     const candidates = db.query<ImageRow, []>("SELECT i.* FROM images i JOIN tasks t ON t.id=i.task_id WHERE i.status='queued' AND t.status IN ('queued','running') ORDER BY t.created,t.rowid,i.position LIMIT 500").all()
     for (const image of candidates) {
       const task = getTask(image.task_id)!
-      const busy = db.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM images WHERE task_id=? AND status IN ('generating','uploading')").get(task.id)!.count
-      if (busy >= options.taskConcurrency) continue
       let account: Account | null = null
       if (!task.demo) {
         const source = accountSource(task.model)
-        account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
+        // Least-loaded first (inflight relative to slots), then least recently used, so work spreads before any account stacks up.
+        account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY CAST(inflight AS REAL)/slots,inflight,last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
         if (!account) continue
         db.run('UPDATE accounts SET inflight=inflight+1,last_used=? WHERE id=?', [Date.now(), account.id])
       }
@@ -119,14 +115,12 @@ export async function pump() {
   try {
     // Recover uploads separately: a persisted result must never be regenerated.
     for (const image of db.query<ImageRow, []>("SELECT * FROM images WHERE status='uploading'").all()) {
-      if (running.size >= settings().globalConcurrency) break
       if (running.has(image.id)) continue
       running.add(image.id)
       void upload(image.id).catch(error => db.run("UPDATE images SET status='error',error=?,finished=? WHERE id=?", [safeError(error), Date.now(), image.id])).finally(() => { running.delete(image.id); updateTaskStatus(image.task_id) })
     }
-    while (running.size < settings().globalConcurrency) {
-      const job = claimImage()
-      if (!job) break
+    // Account slots are the only concurrency limit; claim until no queued image has a free account.
+    for (let job = claimImage(); job; job = claimImage()) {
       running.add(job.image.id)
       void execute(job)
     }

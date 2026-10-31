@@ -1,4 +1,4 @@
-import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Task, type Settings, type ImageRow } from './store'
+import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Account, type Task, type Settings, type ImageRow } from './store'
 import { refreshAccount, safeError } from './adapter'
 import { submitTask, taskFingerprint, retryTask, pump, baseUrl } from './scheduler'
 import { imageUrl, imageBase64, testOss } from './storage'
@@ -6,8 +6,8 @@ import { validateImageUrl } from './network'
 import { normalizeAccount, saveAccount } from './accounts'
 import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
-import { IMAGE_MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
-import { supportsCodexImages } from './account-policy'
+import { IMAGE_MODELS, MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
+import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
@@ -39,11 +39,16 @@ function identity(request: Request): Identity {
   }
   throw new HttpError(401, '请登录或使用有效的 API 密钥')
 }
+const usableAccount = (a: Account) => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (a.source !== 'codex' || supportsCodexImages(a.plan))
+function modelList() {
+  const usable = accounts().filter(usableAccount)
+  return MODELS.map(model => ({ ...model, accounts: usable.filter(a => a.source === model.source).length }))
+}
 function checkOrigin(request: Request) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.headers.has('authorization')) return
   const origin = request.headers.get('origin')
   const allowed = new Set([new URL(request.url).origin, baseUrl()])
-  if (process.env.NODE_ENV !== 'production') { allowed.add('http://127.0.0.1:5173'); allowed.add('http://localhost:5173') }
+  if (process.env.NODE_ENV !== 'production') { const port = process.env.DEV_WEB_PORT || '5173'; allowed.add(`http://127.0.0.1:${port}`); allowed.add(`http://localhost:${port}`) }
   if (origin && !allowed.has(origin)) throw new HttpError(403, '请求来源不被允许')
 }
 async function serialize(task: Task) {
@@ -85,8 +90,10 @@ async function createTask(request: Request, input: any, who: Identity) {
   if (!demo) {
     const source = accountSource(model)
     const pool = accounts().filter(a => a.source === source)
-    if (!pool.length) throw new HttpError(409, `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号`)
-    if (!pool.some(a => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (source !== 'codex' || supportsCodexImages(a.plan)))) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型`)
+    const others = modelList().filter(m => m.id !== model && m.accounts > 0).map(m => m.id)
+    const hint = others.length ? `；当前可用的模型：${others.join('、')}` : ''
+    if (!pool.length) throw new HttpError(409, `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号${hint}`)
+    if (!pool.some(usableAccount)) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型${hint}`)
   }
   await saveReferences(uploads)
   const task = submitTask({ owner: who.owner, prompt, model, size, quality, n, refs, demo, clientId })
@@ -128,8 +135,9 @@ export async function handleApi(request: Request): Promise<Response> {
       const allAccounts = accounts(), allTasks = db.query<Task, []>('SELECT * FROM tasks ORDER BY created DESC LIMIT 100').all()
       const keys = db.query('SELECT id,name,prefix,enabled,created,last_used FROM api_keys ORDER BY created DESC').all()
       const counts = db.query<{ status: string; count: number }, []>('SELECT status,COUNT(*) AS count FROM images GROUP BY status').all()
-      const hourly = db.query('SELECT CAST(created/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM tasks WHERE created>? GROUP BY hour ORDER BY hour').all(Date.now() - 24 * 3600_000)
-      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), hourly, serverTime: Date.now(), baseUrl: baseUrl() })
+      const delivered = db.query<{ status: string; count: number }, []>("SELECT images.status,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status IN ('success','error') GROUP BY images.status").all()
+      const hourly = db.query("SELECT CAST(images.finished/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status='success' AND images.finished>? GROUP BY hour ORDER BY hour").all(Date.now() - 24 * 3600_000)
+      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, models: modelList(), serverTime: Date.now(), baseUrl: baseUrl() })
     }
     if (path === '/api/accounts' && request.method === 'POST') {
       const input = await body(request)
@@ -159,7 +167,7 @@ export async function handleApi(request: Request): Promise<Response> {
         const input = await body(request)
         const status = input.enabled === undefined ? account.status : input.enabled ? 'pending' : 'disabled'
         const name = String(input.name || account.name).slice(0, 80)
-        const slots = integer(input.slots, account.slots, 1, 3)
+        const slots = integer(input.slots, account.slots, 1, MAX_ACCOUNT_SLOTS)
         db.run('UPDATE accounts SET name=?,slots=?,status=? WHERE id=?', [name, slots, status, account.id])
         if (input.enabled) void refreshAccount(account.id).catch(() => {})
         return json({ ok: true })
@@ -177,8 +185,6 @@ export async function handleApi(request: Request): Promise<Response> {
     if (path === '/api/settings' && request.method === 'POST') {
       const input = await body(request), previous = settings()
       const value: Settings = { ...previous,
-        globalConcurrency: integer(input.globalConcurrency, previous.globalConcurrency, 1, 30),
-        taskConcurrency: integer(input.taskConcurrency, previous.taskConcurrency, 1, 7),
         queueLimit: integer(input.queueLimit, previous.queueLimit, 10, 2000),
         jobTimeoutSeconds: integer(input.jobTimeoutSeconds, previous.jobTimeoutSeconds, 60, 1800),
         refreshMinutes: integer(input.refreshMinutes, previous.refreshMinutes, 1, 60),
@@ -186,14 +192,13 @@ export async function handleApi(request: Request): Promise<Response> {
         allowedImageHosts: (Array.isArray(input.allowedImageHosts) ? input.allowedImageHosts : []).map((v: unknown) => String(v).trim().toLowerCase()).filter(Boolean),
         oss: { ...previous.oss, region: String(input.oss?.region || '').trim(), bucket: String(input.oss?.bucket || '').trim(), endpoint: String(input.oss?.endpoint || '').trim(), prefix: String(input.oss?.prefix || 'atelier').trim(), urlExpiry: integer(input.oss?.urlExpiry, previous.oss.urlExpiry, 60, 86400), accessKeyId: input.oss?.accessKeyId && !String(input.oss.accessKeyId).startsWith('****') ? String(input.oss.accessKeyId).trim() : previous.oss.accessKeyId, accessKeySecret: input.oss?.accessKeySecret ? String(input.oss.accessKeySecret).trim() : previous.oss.accessKeySecret },
       }
-      if (value.taskConcurrency > value.globalConcurrency) return bad('单任务并发不能超过总并发')
       if (value.publicBaseUrl && !/^https:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:\/[^\s]*)?$/.test(value.publicBaseUrl)) return bad('图片公开域名需要 HTTPS 地址')
       if (value.oss.endpoint && !/^https:\/\/[A-Za-z0-9.-]+(?::443)?\/?$/.test(value.oss.endpoint)) return bad('OSS Endpoint 需要 HTTPS 域名')
       if (value.storage === 'oss' && (!value.oss.region || !value.oss.bucket || !value.oss.accessKeyId || !value.oss.accessKeySecret)) return bad('使用 OSS 前请补全存储配置')
       saveSettings(value); return json({ ok: true })
     }
     if (path === '/api/settings/test-oss' && request.method === 'POST') return json(await testOss())
-    if (path === '/v1/models') return json({ object: 'list', data: IMAGE_MODELS.map(model => ({ id: model, object: 'model', owned_by: 'atelier' })) })
+    if (path === '/v1/models') return json({ object: 'list', data: modelList().map(model => ({ id: model.id, object: 'model', owned_by: 'atelier', available: model.accounts > 0 })) })
     if (['/api/tasks', '/v1/image-tasks', '/v1/images/generations', '/v1/images/edits'].includes(path) && request.method === 'POST') {
       const input = await imageBody(request, body)
       const task = await createTask(request, input, who)
