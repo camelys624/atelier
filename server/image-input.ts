@@ -13,7 +13,27 @@ export const MODELS = [
 ] as const satisfies readonly { id: string; name: string; source: 'web' | 'codex'; description: string }[]
 export const IMAGE_MODELS: string[] = MODELS.map(m => m.id)
 export const accountSource = (model: string) => MODELS.find(m => m.id === model)?.source ?? 'codex'
-export const isUploadedReference = (value: string) => /^upload:[a-f0-9]{64}$/.test(value)
+// Clients send many sizes ("1792x1024", "16:9", "2K"); snap each to the closest output we can produce instead of rejecting it.
+const SIZES = [['1024x1024', 1], ['1536x1024', 3 / 2], ['1024x1536', 2 / 3]] as const
+const parseRatio = (value: unknown) => {
+  const match = String(value ?? '').trim().match(/^(\d+(?:\.\d+)?)\s*[x×*:/]\s*(\d+(?:\.\d+)?)$/i)
+  const ratio = match ? Number(match[1]) / Number(match[2]) : NaN
+  return Number.isFinite(ratio) && ratio > 0 ? ratio : undefined
+}
+export function normalizeSize(size: unknown, aspectRatio?: unknown) {
+  const ratio = parseRatio(size) ?? parseRatio(aspectRatio)
+  if (ratio === undefined) return String(size ?? '').trim().toLowerCase() === 'auto' ? 'auto' : '1024x1024'
+  return SIZES.reduce((best, item) => Math.abs(Math.log(item[1] / ratio)) < Math.abs(Math.log(best[1] / ratio)) ? item : best)[0]
+}
+const QUALITY_ALIASES: Record<string, string> = { standard: 'medium', normal: 'medium', hd: 'high', ultra: 'xhigh', highest: 'max', best: 'max' }
+export function normalizeQuality(quality: unknown, model: string) {
+  const text = String(quality ?? '').trim().toLowerCase()
+  const value = QUALITY_ALIASES[text] ?? text
+  if (['auto', 'low', 'medium', 'high'].includes(value)) return value
+  if (['xhigh', 'max'].includes(value)) return model === 'gpt-image-2.5-sunburst' ? value : 'high'
+  return 'auto'
+}
+export const isUploadedReference =(value: string) => /^upload:[a-f0-9]{64}$/.test(value)
 export const referencePath = (value: string) => {
   if (!isUploadedReference(value)) throw new Error('无效的上传图片标识')
   return resolve(dataDir, 'references', value.slice(7))

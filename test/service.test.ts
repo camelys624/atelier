@@ -17,7 +17,7 @@ const { validateImageUrl, fetchReference } = await import('../server/network')
 const { withImageTransfer } = await import('../server/image-transfers')
 const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/device-auth')
 const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
-const { MAX_UPLOAD_BYTES, referencePath, uploadedReference } = await import('../server/image-input')
+const { MAX_UPLOAD_BYTES, referencePath, uploadedReference, normalizeSize, normalizeQuality } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
 const { AdapterTimeoutError, bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
 const { needsAccountRefresh } = await import('../server/account-policy')
@@ -108,6 +108,15 @@ describe('image edit SDK compatibility', () => {
       await waitFor(() => getTask(value.id)!.status === 'success')
     }
   })
+  test('snaps unsupported sizes and qualities to the closest supported value', () => {
+    expect(normalizeSize(undefined)).toBe('1024x1024'); expect(normalizeSize('auto')).toBe('auto'); expect(normalizeSize('bogus')).toBe('1024x1024')
+    expect(normalizeSize('1792x1024')).toBe('1536x1024'); expect(normalizeSize('1024x1792')).toBe('1024x1536'); expect(normalizeSize('4096x4096')).toBe('1024x1024')
+    expect(normalizeSize('16:9')).toBe('1536x1024'); expect(normalizeSize('9:16')).toBe('1024x1536'); expect(normalizeSize('4:3')).toBe('1536x1024'); expect(normalizeSize('6:5')).toBe('1024x1024')
+    expect(normalizeSize('2K', '21:9')).toBe('1536x1024'); expect(normalizeSize('4K')).toBe('1024x1024')
+    expect(normalizeQuality('hd', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('standard', 'gpt-image-2')).toBe('medium')
+    expect(normalizeQuality('max', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('max', 'gpt-image-2.5-sunburst')).toBe('max')
+    expect(normalizeQuality('ultra', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('bogus', 'gpt-image-2')).toBe('auto'); expect(normalizeQuality(undefined, 'gpt-image-2')).toBe('auto')
+  })
   test('rejects empty/malformed/oversized uploads, invalid settings and unsupported fields before queuing', async () => {
     expect((await edit(form({}, []))).status).toBe(400)
     expect((await edit(form({}, [new Blob([])]))).status).toBe(400)
@@ -115,7 +124,7 @@ describe('image edit SDK compatibility', () => {
     expect((await edit(form({}, Array.from({ length: 8 }, () => new Blob([png]))))).status).toBe(400)
     expect((await edit(form({}, [new Blob([new Uint8Array(10 * 1024 * 1024 + 1)])]))).status).toBe(413)
     expect((await edit(form(), { ...admin, 'Content-Length': String(MAX_UPLOAD_BYTES + 1) })).status).toBe(413)
-    const invalidFields: Record<string, string>[] = [{ size: 'bogus' }, { quality: 'ultra' }, { stream: 'true' }, { mask: 'unsupported' }, { output_format: 'jpeg' }]
+    const invalidFields: Record<string, string>[] = [{ stream: 'true' }, { mask: 'unsupported' }, { output_format: 'jpeg' }]
     for (const fields of invalidFields) expect((await edit(form(fields))).status).toBe(400)
     expect((await edit(form(), {})).status).toBe(401)
     const text = await handleApi(new Request('http://localhost/v1/images/edits', { method: 'POST', headers: { ...admin, 'Content-Type': 'multipart/form-data; boundary=missing' }, body: 'broken' }))

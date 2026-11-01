@@ -6,7 +6,7 @@ import { validateImageUrl } from './network'
 import { normalizeAccount, saveAccount } from './accounts'
 import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
-import { IMAGE_MODELS, MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference } from './image-input'
+import { IMAGE_MODELS, MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference, normalizeSize, normalizeQuality } from './image-input'
 import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
@@ -66,9 +66,7 @@ async function createTask(request: Request, input: any, who: Identity) {
   if (!prompt || prompt.length > 12_000) return bad('请输入提示词，最多 12000 字符')
   const model = String(input.model || 'gpt-image-2')
   if (!IMAGE_MODELS.includes(model)) return bad(`不支持这个生图模型，可使用 ${IMAGE_MODELS.join('、')}`)
-  const size = String(input.size || '1024x1024'), quality = String(input.quality || 'auto')
-  if (!['auto', '1024x1024', '1536x1024', '1024x1536'].includes(size)) return bad('size 支持 auto、1024x1024、1536x1024、1024x1536')
-  if (!['auto', 'low', 'medium', 'high', ...(model === 'gpt-image-2.5-sunburst' ? ['xhigh', 'max'] : [])].includes(quality)) return bad('不支持这个 quality，请使用 auto、low、medium、high（Sunburst 还支持 xhigh、max）')
+  const size = normalizeSize(input.size, input.aspect_ratio ?? input.aspectRatio), quality = normalizeQuality(input.quality, model)
   if (input.stream) return bad('第一版提供任务轮询接口，暂不支持流式返回')
   if (input.response_format && !['url', 'b64_json'].includes(input.response_format)) return bad('response_format 只支持 url 或 b64_json')
   if (input.output_format && input.output_format !== 'png') return bad('当前仅支持 output_format=png')
