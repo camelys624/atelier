@@ -1,4 +1,4 @@
-import { mkdir, rename, unlink } from 'node:fs/promises'
+import { mkdir, rename, unlink, utimes } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { dataDir } from './store'
 import { HttpError } from './http'
@@ -105,7 +105,8 @@ export async function saveReferences(uploads: Upload[]) {
   await mkdir(resolve(dataDir, 'references'), { recursive: true, mode: 0o700 })
   for (const { reference, file } of uploads) {
     const path = referencePath(reference)
-    if (await Bun.file(path).exists()) continue
+    // A reused reference is touched so retention cleanup does not delete it under the new task.
+    if (await Bun.file(path).exists()) { const now = new Date(); await utimes(path, now, now).catch(() => {}); continue }
     const temporary = `${path}.${crypto.randomUUID()}.part`
     try { await Bun.write(temporary, file); await rename(temporary, path) }
     finally { await unlink(temporary).catch(() => {}) }

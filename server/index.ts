@@ -3,6 +3,7 @@ import { db, recoverInterruptedTasks, type ImageRow } from './store'
 import { handleApi } from './api'
 import { startScheduler, stopScheduler } from './scheduler'
 import { stopAdapters } from './adapter'
+import { startCleanup, stopCleanup } from './retention'
 import { deviceAuth } from './device-auth'
 import { MAX_UPLOAD_BYTES } from './image-input'
 
@@ -39,5 +40,6 @@ const server = Bun.serve({
 recoverInterruptedTasks()
 deviceAuth.start()
 startScheduler()
+startCleanup()
 console.log(`Atelier 已启动：http://${server.hostname}:${server.port}`)
-for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => { deviceAuth.stop(); stopScheduler(); stopAdapters(); server.stop(true); db.close(); process.exit(0) })
+for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => { deviceAuth.stop(); stopScheduler(); stopCleanup(); stopAdapters(); server.stop(true); db.close(); process.exit(0) })
