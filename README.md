@@ -37,6 +37,16 @@ bun run start
 docker compose up -d --build
 ```
 
+也可以在服务器的仓库目录中使用部署脚本，它会先拉取最新代码，再检查 `.env`、备份数据库、构建并重启容器，再等待健康检查通过：
+
+```sh
+scripts/deploy.sh             # 拉取当前分支最新代码后部署
+scripts/deploy.sh --no-pull   # 不拉取，直接部署当前代码
+scripts/deploy.sh --help      # 查看全部选项（跳过备份、清理旧镜像、超时时间）
+```
+
+数据库快照保存在 `backups/atelier-<时间>.sqlite`（仅在容器运行时备份）。健康检查未通过时脚本会打印最近的容器日志并以非零状态退出。
+
 Compose 默认仅监听宿主机 `127.0.0.1:3080`，由服务器的 HTTPS 反向代理转发。将 `BASE_URL` 设置为实际访问的 HTTPS 域名；HTTPS 下登录 Cookie 启用 Secure。账号和图片保存在持久卷 `atelier_data` 中。
 
 请备份数据库和 `MASTER_KEY`。丢失主密钥后，数据库中的加密凭证无法恢复。服务启动会恢复尚未上传的图片；重启时仍在生成且无本地结果的图片会标记为失败，由管理员确认后重试，避免重复扣上游额度。
