@@ -29,7 +29,7 @@ Options:
 
 Environment:
   HEALTH_URL       Health check URL (default: http://127.0.0.1:3080/health)
-  BACKUP_DIR       Backup directory (default: <repo>/backups)
+  BACKUP_DIR       Backup directory (default: <repo>/backups; keeps latest 3)
 EOF
 }
 
@@ -47,6 +47,21 @@ done
 
 log() { printf '\n==> %s\n' "$*"; }
 fail() { echo "Deploy failed: $*" >&2; exit 1; }
+
+prune_backups() {
+  local backup i
+  local -a backups=()
+  # Timestamped names sort oldest first. Ignore unrelated files and symlinks.
+  for backup in "$BACKUP_DIR"/atelier-*.sqlite; do
+    if [[ -f "$backup" && ! -L "$backup" && "${backup##*/}" =~ ^atelier-[0-9]{8}-[0-9]{6}\.sqlite$ ]]; then
+      backups+=("$backup")
+    fi
+  done
+  for ((i = 0; i < ${#backups[@]} - 3; i++)); do
+    rm -- "${backups[i]}"
+    echo "Removed old backup: ${backups[i]}"
+  done
+}
 
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || fail "--timeout needs a whole number of seconds"
 docker compose version >/dev/null 2>&1 || fail "docker compose not found; install Docker and the Compose plugin"
@@ -84,10 +99,12 @@ if ((BACKUP)); then
     SNAPSHOT="/app/data/deploy-backup-$STAMP.sqlite"
     # VACUUM INTO writes a consistent snapshot, including writes still in the WAL.
     docker compose exec -T atelier bun -e "const { Database } = await import('bun:sqlite'); new Database('/app/data/atelier.sqlite').run(\"VACUUM INTO '$SNAPSHOT'\")"
-    docker compose cp "atelier:$SNAPSHOT" "$BACKUP_DIR/atelier-$STAMP.sqlite"
+    docker compose cp "atelier:$SNAPSHOT" "$BACKUP_DIR/atelier-$STAMP.sqlite.part"
     docker compose exec -T atelier rm -f "$SNAPSHOT"
-    chmod 600 "$BACKUP_DIR/atelier-$STAMP.sqlite"
+    chmod 600 "$BACKUP_DIR/atelier-$STAMP.sqlite.part"
+    mv -- "$BACKUP_DIR/atelier-$STAMP.sqlite.part" "$BACKUP_DIR/atelier-$STAMP.sqlite"
     echo "Backed up to $BACKUP_DIR/atelier-$STAMP.sqlite"
+    prune_backups
   else
     echo "Container not running; skipping backup"
   fi

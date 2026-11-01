@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import OSS from 'ali-oss'
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -17,10 +17,11 @@ const { validateImageUrl, fetchReference } = await import('../server/network')
 const { withImageTransfer } = await import('../server/image-transfers')
 const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/device-auth')
 const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
-const { MAX_UPLOAD_BYTES, referencePath, uploadedReference, normalizeSize, normalizeQuality } = await import('../server/image-input')
+const { MAX_UPLOAD_BYTES, referencePath, uploadedReference, saveReferences, normalizeSize, normalizeQuality } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
 const { AdapterTimeoutError, bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
 const { needsAccountRefresh } = await import('../server/account-policy')
+const { cleanupImages } = await import('../server/retention')
 const { db, defaults, seal, unseal, getTask, taskImages, saveSettings } = store
 const admin = { Authorization: `Bearer ${process.env.ADMIN_KEY}` }
 function request(path: string, body?: any, headers: Record<string, string> = admin, method?: string) {
@@ -149,6 +150,35 @@ describe('image edit SDK compatibility', () => {
   })
 })
 
+describe('image retention', () => {
+  const hours = (n: number) => n * 3_600_000
+  const file = (path: string, ageHours: number) => { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, 'image-bytes'); const at = new Date(Date.now() - hours(ageHours)); utimesSync(path, at, at); return path }
+  test('deletes results, leftovers and unused references older than the retention window', async () => {
+    const spool = join(temporary, 'spool'), references = join(temporary, 'references')
+    const [old, fresh, live] = [task('admin', 1), task('admin', 1), task('admin', 1)].map(t => taskImages(t.id)[0])
+    db.run("UPDATE images SET status='success',local_path=?,finished=? WHERE id=?", [file(join(spool, 'old.png'), 30), Date.now() - hours(30), old.id])
+    db.run("UPDATE images SET status='success',local_path=?,finished=? WHERE id=?", [file(join(spool, 'fresh.png'), 1), Date.now() - hours(1), fresh.id])
+    db.run("UPDATE images SET status='uploading',local_path=? WHERE id=?", [file(join(spool, 'live.png'), 30), live.id])
+    const orphan = file(join(spool, 'img_x.1.ref0'), 30), recentOrphan = file(join(spool, 'img_y.1.ref0'), 1)
+    const unused = file(join(references, 'a'.repeat(64)), 30), needed = file(join(references, 'b'.repeat(64)), 30)
+    scheduler.submitTask({ owner: 'admin', prompt: 'p', model: 'gpt-image-2', n: 1, refs: [`upload:${'b'.repeat(64)}`] })
+
+    const removed = await cleanupImages()
+
+    expect(removed).toMatchObject({ results: 1, leftovers: 1, references: 1 })
+    expect(existsSync(join(spool, 'old.png'))).toBe(false)
+    expect(taskImages(old.task_id)[0].local_path).toBeNull()
+    for (const kept of [join(spool, 'fresh.png'), join(spool, 'live.png'), recentOrphan, needed]) expect(existsSync(kept)).toBe(true)
+    for (const gone of [orphan, unused]) expect(existsSync(gone)).toBe(false)
+  })
+  test('reusing an uploaded reference refreshes it so cleanup keeps it for the new task', async () => {
+    const reference = `upload:${'c'.repeat(64)}`, path = file(referencePath(reference), 30)
+    await saveReferences([{ reference, file: new File(['image-bytes'], 'ref.png') }])
+    expect(Date.now() - statSync(path).mtimeMs).toBeLessThan(hours(1))
+    await cleanupImages()
+    expect(existsSync(path)).toBe(true)
+  })
+})
 describe('account validation network failures', () => {
   test('preserves rotated tokens, schedules a short network retry, then recovers without reimporting', async () => {
     account('transient-network')
