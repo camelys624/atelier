@@ -81,7 +81,7 @@ curl https://your-service.example/v1/image-tasks \
 
 - `POST /v1/images/generations`：同步返回，默认 `response_format: "url"`，也支持 `b64_json`。
 - `POST /v1/images/edits`：接受 `multipart/form-data` 的 `image` 单文件或 `image[]` 多文件，以及 JSON 图片地址。默认返回 `data[].b64_json`，可显式设置 `response_format: "url"` 返回存储地址。
-- 支持字段：`model`、`image`、`prompt`、`size`、`quality`、`n`（1～7）、`response_format`。`size` 支持 `auto`、`1024x1024`（默认）、`1536x1024`、`1024x1536`；`quality` 支持 `auto`（默认）、`low`、`medium`、`high`，Sunburst 另支持 `xhigh`、`max`。当前只输出 PNG，不支持 mask、透明背景、其他输出格式或 SSE。
+- 支持字段：`model`、`image`、`prompt`、`size`、`quality`、`n`（1～7）、`response_format`。`size` 输出 `auto`、`1024x1024`（默认）、`1536x1024`、`1024x1536` 之一：其他尺寸（如 `1792x1024`、`2048x2048`）、比例（如 `16:9`，也可放在 `aspect_ratio` 字段）都会自动匹配比例最接近的支持尺寸，`2K`/`4K` 等清晰度统一按 1K 输出；`quality` 支持 `auto`（默认）、`low`、`medium`、`high`，Sunburst 另支持 `xhigh`、`max`，其他取值自动降级为最接近的支持值（如 `hd`→`high`、`standard`→`medium`，无法识别时为 `auto`）。当前只输出 PNG，不支持 mask、透明背景、其他输出格式或 SSE。
 - 上述两个同步接口也接受 `async: true` 返回 HTTP 202 的任务对象，这是本服务的扩展。
 - 同步等待最多 180 秒。超时返回 HTTP 504 和 `task_id`；后台任务继续执行，应查询已有任务，勿直接重新提交。
 - `POST /v1/image-tasks/{id}/retry`：重试失败图片；已有暂存结果仅重传。已取消任务不可重试。
