@@ -140,6 +140,23 @@ describe('image edit SDK compatibility', () => {
     expect((await request('/v1/models')).status).toBe(200)
     expect((await (await request('/v1/models')).json()).data.some((model: any) => model.id === 'gpt-image-2.5-sunburst')).toBe(true)
   })
+  test('refreshes historical OSS image URLs after switching new images to local storage', async () => {
+    const oss = { ...defaults.oss, region: 'oss-cn-hangzhou', bucket: 'disposable-test-bucket', accessKeyId: 'test-only-access-key', accessKeySecret: 'test-only-secret' }
+    saveSettings({ ...defaults, storage: 'oss', oss })
+    const saved = task('admin', 1), image = taskImages(saved.id)[0]
+    db.run("UPDATE images SET status='success',object_key=?,url=?,finished=? WHERE id=?", ['atelier/task/image.png', 'https://old.example/image.png?Expires=1', Date.now(), image.id])
+    db.run("UPDATE tasks SET status='success' WHERE id=?", [saved.id])
+    expect((await request('/api/settings', { ...defaults, storage: 'local', oss })).status).toBe(200)
+    const signature = spyOn(OSS.prototype, 'signatureUrl').mockReturnValue('https://oss.example/image.png?Expires=fresh')
+    const get = spyOn(OSS.prototype, 'get').mockResolvedValue({ content: png } as any)
+    try {
+      const response = await request(`/api/tasks/${saved.id}`)
+      expect(response.status).toBe(200)
+      expect((await response.json()).images[0].url).toBe('https://oss.example/image.png?Expires=fresh')
+      expect(signature).toHaveBeenCalledWith('atelier/task/image.png', { expires: oss.urlExpiry })
+      expect(await imageBase64(taskImages(saved.id)[0])).toBe(png.toString('base64'))
+    } finally { signature.mockRestore(); get.mockRestore() }
+  })
   test('reads Base64 from OSS after the local generated file has been cleaned up', async () => {
     saveSettings({ ...defaults, storage: 'oss', oss: { ...defaults.oss, region: 'oss-cn-hangzhou', bucket: 'disposable-test-bucket', accessKeyId: 'test-only-access-key', accessKeySecret: 'test-only-secret' } })
     const get = spyOn(OSS.prototype, 'get').mockResolvedValue({ content: png } as any)
@@ -157,6 +174,7 @@ describe('image retention', () => {
     const spool = join(temporary, 'spool'), references = join(temporary, 'references')
     const [old, fresh, live] = [task('admin', 1), task('admin', 1), task('admin', 1)].map(t => taskImages(t.id)[0])
     db.run("UPDATE images SET status='success',local_path=?,finished=? WHERE id=?", [file(join(spool, 'old.png'), 30), Date.now() - hours(30), old.id])
+    db.run("UPDATE tasks SET status='success',updated=? WHERE id=?", [Date.now() - hours(30), old.task_id])
     db.run("UPDATE images SET status='success',local_path=?,finished=? WHERE id=?", [file(join(spool, 'fresh.png'), 1), Date.now() - hours(1), fresh.id])
     db.run("UPDATE images SET status='uploading',local_path=? WHERE id=?", [file(join(spool, 'live.png'), 30), live.id])
     const orphan = file(join(spool, 'img_x.1.ref0'), 30), recentOrphan = file(join(spool, 'img_y.1.ref0'), 1)
@@ -167,9 +185,48 @@ describe('image retention', () => {
 
     expect(removed).toMatchObject({ results: 1, leftovers: 1, references: 1 })
     expect(existsSync(join(spool, 'old.png'))).toBe(false)
-    expect(taskImages(old.task_id)[0].local_path).toBeNull()
+    expect(getTask(old.task_id)).toBeNull()
+    expect(taskImages(old.task_id)).toHaveLength(0)
     for (const kept of [join(spool, 'fresh.png'), join(spool, 'live.png'), recentOrphan, needed]) expect(existsSync(kept)).toBe(true)
     for (const gone of [orphan, unused]) expect(existsSync(gone)).toBe(false)
+  })
+  test('expires completed history across storage types while retaining active and recently finished tasks', async () => {
+    const now = Date.now(), old = now - hours(30)
+    const expired = ['success', 'partial', 'error', 'cancelled'].map(status => {
+      const saved = task('admin', 2)
+      db.run('UPDATE tasks SET status=?,updated=? WHERE id=?', [status, old, saved.id])
+      for (const [index, image] of taskImages(saved.id).entries()) {
+        db.run('UPDATE images SET status=?,finished=?,object_key=?,url=? WHERE id=?', [status === 'partial' ? (index ? 'error' : 'success') : status, old, index ? null : 'old/image.png', 'https://old.example/image.png', image.id])
+      }
+      return saved
+    })
+    const kept = [task('admin', 2), task('admin', 2), task('admin', 1), task('admin', 1)]
+    for (const saved of kept) {
+      db.run("UPDATE tasks SET status='success',updated=? WHERE id=?", [old, saved.id])
+      db.run("UPDATE images SET status='success',finished=? WHERE task_id=?", [old, saved.id])
+    }
+    // Protect an unfinished sibling even when the parent status is stale or cancelled.
+    db.run("UPDATE tasks SET status='cancelled' WHERE id=?", [kept[0].id])
+    db.run("UPDATE images SET status='generating',finished=NULL WHERE id=?", [taskImages(kept[0].id)[1].id])
+    db.run("UPDATE tasks SET status='queued' WHERE id=?", [kept[1].id])
+    db.run("UPDATE images SET status='queued',finished=NULL WHERE id=?", [taskImages(kept[1].id)[1].id])
+    db.run('UPDATE images SET finished=? WHERE task_id=?', [now - hours(1), kept[2].id])
+    db.run('UPDATE tasks SET updated=? WHERE id=?', [now - hours(1), kept[3].id])
+    const protectedFile = file(join(temporary, 'spool', 'active-sibling.png'), 30)
+    db.run('UPDATE images SET local_path=? WHERE id=?', [protectedFile, taskImages(kept[0].id)[0].id])
+    account('retention-keeps-account')
+
+    const removed = await cleanupImages(now)
+
+    expect(removed).toMatchObject({ tasks: 4, results: 8 })
+    for (const saved of expired) {
+      expect(getTask(saved.id)).toBeNull()
+      expect(taskImages(saved.id)).toHaveLength(0)
+      expect((await request(`/api/tasks/${saved.id}`)).status).toBe(404)
+    }
+    for (const saved of kept) { expect(getTask(saved.id)).not.toBeNull(); expect(taskImages(saved.id)).toHaveLength(saved.n) }
+    expect(existsSync(protectedFile)).toBe(true)
+    expect(store.getAccount('retention-keeps-account')).not.toBeNull()
   })
   test('reusing an uploaded reference refreshes it so cleanup keeps it for the new task', async () => {
     const reference = `upload:${'c'.repeat(64)}`, path = file(referencePath(reference), 30)

@@ -2,8 +2,7 @@ import { readdir, stat, unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { db, dataDir } from './store'
 
-// The server disk is small: generated results and uploaded references stay only long enough for callers to
-// fetch them. Task rows are kept so history stays visible; an expired result simply has no file any more.
+// The server disk is small: results, references and completed task history share a short retention window.
 const HOUR = 3_600_000
 export const retentionHours = () => Math.min(24 * 30, Math.max(1, Number(process.env.IMAGE_RETENTION_HOURS) || 24))
 
@@ -21,13 +20,31 @@ async function files(directory: string) {
 
 export async function cleanupImages(now = Date.now()) {
   const cutoff = now - retentionHours() * HOUR
-  let results = 0, leftovers = 0, references = 0, bytes = 0
-  // Finished results past retention. Clearing local_path makes a later retry regenerate instead of re-uploading.
-  const expired = db.query<{ id: string; local_path: string }, [number]>("SELECT id,local_path FROM images WHERE local_path IS NOT NULL AND status IN ('success','error') AND finished < ?").all(cutoff)
+  let tasks = 0, results = 0, leftovers = 0, references = 0, bytes = 0
+  // Remove whole completed tasks together, including old OSS-only and failed history.
+  // Select and delete synchronously so a retry cannot race an asynchronous file deletion.
+  const expired = db.transaction(() => {
+    const rows = db.query<{ id: string }, [number, number]>(`
+      SELECT t.id FROM tasks t
+      WHERE t.status IN ('success','partial','error','cancelled') AND t.updated < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM images i WHERE i.task_id=t.id
+            AND (i.status NOT IN ('success','error','cancelled') OR i.finished >= ?)
+        )
+    `).all(cutoff, cutoff)
+    const files: { local_path: string | null }[] = []
+    for (const task of rows) {
+      files.push(...db.query<{ local_path: string | null }, [string]>('SELECT local_path FROM images WHERE task_id=?').all(task.id))
+      db.run('DELETE FROM images WHERE task_id=?', [task.id])
+      db.run('DELETE FROM tasks WHERE id=?', [task.id])
+    }
+    tasks = rows.length
+    return files
+  }).immediate()
+  results = expired.length
   for (const image of expired) {
+    if (!image.local_path) continue
     try { const info = await stat(image.local_path); await unlink(image.local_path); bytes += info.size } catch {}
-    db.run('UPDATE images SET local_path=NULL WHERE id=?', [image.id])
-    results++
   }
   // Spool files no image points to: earlier attempts and downloaded references that outlived their attempt.
   const live = new Set(db.query<{ local_path: string }, []>('SELECT local_path FROM images WHERE local_path IS NOT NULL').all().map(r => r.local_path))
@@ -43,8 +60,8 @@ export async function cleanupImages(now = Date.now()) {
     const size = await removeOld(file.path, cutoff)
     if (size) { references++; bytes += size }
   }
-  if (results || leftovers || references) console.log(JSON.stringify({ event: 'image_cleanup', time: new Date(now).toISOString(), retentionHours: retentionHours(), results, leftovers, references, bytes }))
-  return { results, leftovers, references, bytes }
+  if (tasks || results || leftovers || references) console.log(JSON.stringify({ event: 'image_cleanup', time: new Date(now).toISOString(), retentionHours: retentionHours(), tasks, results, leftovers, references, bytes }))
+  return { tasks, results, leftovers, references, bytes }
 }
 
 let timer: ReturnType<typeof setInterval> | undefined

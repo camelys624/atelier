@@ -25,7 +25,8 @@ export async function persistImage(image: ImageRow, baseUrl: string) {
 }
 export async function imageUrl(image: Pick<ImageRow, 'url' | 'object_key'>) {
   const s = settings()
-  if (!image.object_key || s.storage !== 'oss' || s.publicBaseUrl) return image.url
+  // New-image storage settings must not stop historical OSS links from being refreshed.
+  if (!image.object_key || s.publicBaseUrl) return image.url
   return ossClient().signatureUrl(image.object_key, { expires: s.oss.urlExpiry })
 }
 export async function imageBase64(image: Pick<ImageRow, 'local_path' | 'object_key'>) {
