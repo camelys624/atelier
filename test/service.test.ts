@@ -46,8 +46,97 @@ if (process.argv.includes('--worker')) {
   chmodSync(path, 0o700); stopAdapters()
 }
 async function waitFor(check: () => boolean, timeout = 10_000) { const deadline = Date.now() + timeout; while (!check()) { if (Date.now() > deadline) throw new Error('Timed out'); await Bun.sleep(25) } }
-beforeEach(() => { db.exec('DELETE FROM images; DELETE FROM tasks; DELETE FROM accounts; DELETE FROM api_keys; DELETE FROM sessions; DELETE FROM settings; DELETE FROM device_authorizations;'); saveSettings(structuredClone(defaults)) })
+beforeEach(() => { db.exec('DELETE FROM images; DELETE FROM tasks; DELETE FROM accounts; DELETE FROM api_keys; DELETE FROM sessions; DELETE FROM settings; DELETE FROM device_authorizations; DELETE FROM image_model_config;'); saveSettings(structuredClone(defaults)) })
 afterAll(() => { db.close(); rmSync(temporary, { recursive: true, force: true }) })
+
+describe('web model management', () => {
+  test('initializes persisted defaults and separates enabled models from the admin configuration', async () => {
+    const response = await request('/api/models')
+    expect(response.status).toBe(200)
+    const { models } = await response.json()
+    expect(models.map((model: any) => model.id)).toEqual(['gpt-image-2', 'codex-gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.6-sunburst', 'gpt-image-2.6-flare'])
+    expect(models.filter((model: any) => model.isDefault).map((model: any) => model.id)).toEqual(['gpt-image-2'])
+    expect(models.every((model: any) => model.enabled)).toBe(true)
+    expect(db.query('SELECT 1 FROM image_model_config WHERE id=1').get()).not.toBeNull()
+    expect((await request('/api/models/gpt-image-2.6-flare', { enabled: false }, admin, 'PATCH')).status).toBe(200)
+    const snapshot = await (await request('/api/bootstrap')).json()
+    expect(snapshot.models).toHaveLength(4)
+    expect(snapshot.configuredModels).toHaveLength(5)
+    expect(snapshot.configuredModels.find((model: any) => model.id === 'gpt-image-2.6-flare').enabled).toBe(false)
+    expect((await (await request('/v1/models')).json()).data.some((model: any) => model.id === 'gpt-image-2.6-flare')).toBe(false)
+    expect((await request('/api/models/gpt-image-2.6-flare', { enabled: true }, admin, 'PATCH')).status).toBe(200)
+    expect((await (await request('/v1/models')).json()).data).toHaveLength(5)
+  })
+  test('applies additions, default selection and capability edits to new requests immediately', async () => {
+    account('configured-codex', null)
+    db.run("UPDATE accounts SET source='codex',plan='prolite',inflight=1 WHERE id='configured-codex'")
+    const configuration = { id: 'future-image', name: 'Future image', source: 'codex', sizes: ['1536x864', '864x1536'], qualities: ['high', 'max'] }
+    expect((await request('/api/models', configuration)).status).toBe(201)
+    expect((await request('/api/models/future-image/default', {})).status).toBe(200)
+    const response = await request('/v1/image-tasks', { prompt: 'configured image', size: '9:16', quality: 'highest' })
+    expect(response.status).toBe(202)
+    const saved = await response.json()
+    expect(saved).toMatchObject({ model: 'future-image', size: '864x1536', quality: 'max' })
+    expect((await request('/api/models/future-image', { name: 'Updated name', qualities: ['high'] }, admin, 'PATCH')).status).toBe(200)
+    const next = await (await request('/v1/image-tasks', { prompt: 'new capability', quality: 'max' })).json()
+    expect(next).toMatchObject({ model: 'future-image', size: '1536x864', quality: 'high' })
+    expect(getTask(saved.id)!.quality).toBe('max')
+    const models = (await (await request('/v1/models')).json()).data
+    expect(models.find((model: any) => model.id === 'future-image')).toMatchObject({ isDefault: true, qualities: ['high'], available: true })
+    expect((await (await request('/api/models')).json()).models.find((model: any) => model.id === 'future-image').name).toBe('Updated name')
+  })
+  test('keeps queued tasks schedulable after their model is disabled and deleted', async () => {
+    account('retained-codex', null)
+    db.run("UPDATE accounts SET source='codex',plan='prolite',inflight=1 WHERE id='retained-codex'")
+    expect((await request('/api/models', { id: 'retained-image', source: 'codex' })).status).toBe(201)
+    const queued = await (await request('/v1/image-tasks', { prompt: 'keep queued', model: 'retained-image' })).json()
+    expect((await request('/api/models/retained-image', { enabled: false }, admin, 'PATCH')).status).toBe(200)
+    expect((await request('/v1/image-tasks', { prompt: 'blocked', model: 'retained-image' })).status).toBe(400)
+    expect((await request('/api/models/retained-image', undefined, admin, 'DELETE')).status).toBe(200)
+    expect((await request(`/api/tasks/${queued.id}`)).status).toBe(200)
+    db.run("UPDATE accounts SET inflight=0 WHERE id='retained-codex'")
+    const claim = scheduler.claimImage()!
+    expect(claim.task.model).toBe('retained-image')
+    expect(claim.account!.id).toBe('retained-codex')
+    expect((await request('/api/models/retained-image', undefined, admin, 'DELETE')).status).toBe(404)
+  })
+  test('prevents invalid configuration and guards the default model without partially saving changes', async () => {
+    expect((await request('/api/models/gpt-image-2', { enabled: false }, admin, 'PATCH')).status).toBe(409)
+    expect((await request('/api/models/gpt-image-2', undefined, admin, 'DELETE')).status).toBe(409)
+    expect((await request('/api/models', { id: 'gpt-image-2' })).status).toBe(409)
+    expect((await request('/api/models/missing', { name: 'missing' }, admin, 'PATCH')).status).toBe(404)
+    expect((await request('/api/models/missing/default', {})).status).toBe(404)
+    expect((await request('/api/models/gpt-image-2.6-flare', { enabled: false }, admin, 'PATCH')).status).toBe(200)
+    expect((await request('/api/models/gpt-image-2.6-flare/default', {})).status).toBe(409)
+    const invalidFields = [{ id: 'bad id' }, { source: 'web' }, { source: 'api' }, { name: '' }, { name: 'x'.repeat(101) }, { description: 1 }, { enabled: 'true' }, { qualities: [] }, { qualities: ['hd'] }, { qualities: ['high', 'high'] }, { qualities: null }, { sizes: [] }, { sizes: ['auto'] }, { sizes: ['0x0'] }, { sizes: ['1001x1024'] }, { sizes: ['1024x16'] }, { sizes: ['1024x1024', '1024x1024'] }, { sizes: null }, { quality: ['max'] }]
+    for (const input of [null, [], {}, ...invalidFields.map(fields => ({ id: 'invalid-image', source: 'codex', ...fields }))]) expect((await request('/api/models', input)).status).toBe(400)
+    expect((await request('/api/models/gpt-image-2.6-sunburst', { id: 'renamed' }, admin, 'PATCH')).status).toBe(400)
+    expect((await request('/api/models/gpt-image-2', { source: 'codex' }, admin, 'PATCH')).status).toBe(400)
+    expect((await (await request('/api/models')).json()).models).toHaveLength(5)
+    expect((await (await request('/v1/models')).json()).data.find((model: any) => model.isDefault).id).toBe('gpt-image-2')
+  })
+  test('requires administrator access and rejects cross-origin model mutations', async () => {
+    const key = await (await request('/api/keys', { name: 'business key' })).json()
+    const business = { Authorization: `Bearer ${key.key}` }
+    expect((await request('/api/models', undefined, {})).status).toBe(401)
+    expect((await request('/api/models', undefined, business)).status).toBe(403)
+    expect((await request('/api/models', { id: 'forbidden', source: 'codex' }, business)).status).toBe(403)
+    expect((await request('/api/models/gpt-image-2.6-flare', { enabled: false }, business, 'PATCH')).status).toBe(403)
+    expect((await request('/api/models/gpt-image-2.6-flare/default', {}, business)).status).toBe(403)
+    expect((await request('/api/models/gpt-image-2.6-flare', undefined, business, 'DELETE')).status).toBe(403)
+    expect((await request('/api/model-settings', { responsesModel: 'forbidden-model' }, business)).status).toBe(403)
+    expect((await request('/api/models', { id: 'forbidden', source: 'codex' }, { Origin: 'https://untrusted.example' })).status).toBe(403)
+    expect((await request('/v1/models', undefined, business)).status).toBe(200)
+  })
+  test('saves the internal calling model independently and rejects invalid values', async () => {
+    expect((await (await request('/api/models')).json()).responsesModel).toBe('gpt-6.1-sol')
+    expect((await request('/api/model-settings', { responsesModel: ' custom-call-model ' })).status).toBe(200)
+    expect((await (await request('/api/bootstrap')).json()).responsesModel).toBe('custom-call-model')
+    for (const responsesModel of ['', 'bad model', null, 123, 'a'.repeat(129)]) expect((await request('/api/model-settings', { responsesModel })).status).toBe(400)
+    expect((await (await request('/api/models')).json()).responsesModel).toBe('custom-call-model')
+    expect((await (await request('/v1/models')).json()).data.find((model: any) => model.isDefault).id).toBe('gpt-image-2')
+  })
+})
 
 describe('image edit SDK compatibility', () => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
@@ -109,6 +198,29 @@ describe('image edit SDK compatibility', () => {
       await waitFor(() => getTask(value.id)!.status === 'success')
     }
   })
+  test('generates and edits with both 2.6 models, retaining their size and max quality through the adapter', async () => {
+    const previous = process.env.PYTHON_BIN, fake = join(temporary, 'new-model-adapter'), capture = join(temporary, 'new-model-request.json')
+    fakeAdapter(fake, `await Bun.write(${JSON.stringify(capture)},JSON.stringify(p)); await Bun.write(p.output,Buffer.from(${JSON.stringify(png.toString('base64'))},'base64')); return {ok:true,mime:'image/png',bytes:${png.length}}`)
+    process.env.PYTHON_BIN = fake
+    account('new-model-codex', null)
+    db.run("UPDATE accounts SET source='codex',plan='prolite' WHERE id='new-model-codex'")
+    expect((await request('/api/model-settings', { responsesModel: 'configured-call-model' })).status).toBe(200)
+    try {
+      const models = (await (await request('/v1/models')).json()).data
+      for (const model of ['gpt-image-2.6-sunburst', 'gpt-image-2.6-flare']) {
+        expect(models.find((item: any) => item.id === model)).toMatchObject({ available: true, source: 'codex', qualities: ['auto', 'low', 'medium', 'high', 'xhigh', 'max'] })
+        for (const editing of [false, true]) {
+          const response = editing ? await edit(form({ model, size: '1024x1536', quality: 'max', async: 'true' })) : await request('/v1/images/generations', { model, prompt: 'test generation', size: '1024x1536', quality: 'max', async: true })
+          expect(response.status).toBe(202)
+          const saved = await response.json()
+          await waitFor(() => getTask(saved.id)!.status === 'success')
+          expect(await Bun.file(capture).json()).toMatchObject({ model, responses_model: 'configured-call-model', size: '1024x1536', quality: 'max', account: { source_type: 'codex' } })
+          expect((await Bun.file(capture).json()).images).toHaveLength(editing ? 1 : 0)
+          expect(taskImages(saved.id)[0].account_id).toBe('new-model-codex')
+        }
+      }
+    } finally { stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+  })
   test('snaps unsupported sizes and qualities to the closest supported value', () => {
     expect(normalizeSize(undefined)).toBe('1024x1024'); expect(normalizeSize('auto')).toBe('auto'); expect(normalizeSize('bogus')).toBe('1024x1024')
     expect(normalizeSize('1792x1024')).toBe('1536x1024'); expect(normalizeSize('1024x1792')).toBe('1024x1536'); expect(normalizeSize('4096x4096')).toBe('1024x1024')
@@ -125,7 +237,7 @@ describe('image edit SDK compatibility', () => {
     expect((await edit(form({}, Array.from({ length: 8 }, () => new Blob([png]))))).status).toBe(400)
     expect((await edit(form({}, [new Blob([new Uint8Array(10 * 1024 * 1024 + 1)])]))).status).toBe(413)
     expect((await edit(form(), { ...admin, 'Content-Length': String(MAX_UPLOAD_BYTES + 1) })).status).toBe(413)
-    const invalidFields: Record<string, string>[] = [{ stream: 'true' }, { mask: 'unsupported' }, { output_format: 'jpeg' }]
+    const invalidFields: Record<string, string>[] = [{ stream: 'true' }, { complexity: 'high' }, { mask: 'unsupported' }, { output_format: 'jpeg' }]
     for (const fields of invalidFields) expect((await edit(form(fields))).status).toBe(400)
     expect((await edit(form(), {})).status).toBe(401)
     const text = await handleApi(new Request('http://localhost/v1/images/edits', { method: 'POST', headers: { ...admin, 'Content-Type': 'multipart/form-data; boundary=missing' }, body: 'broken' }))
@@ -515,7 +627,7 @@ describe('durable queue and resource reservations', () => {
     expect(message).toContain('ChatGPT 网页来源账号')
     expect(message).toContain('当前可用的模型：codex-gpt-image-2、gpt-image-2.5-sunburst')
     const models = (await (await request('/v1/models')).json()).data
-    expect(Object.fromEntries(models.map((m: any) => [m.id, m.available]))).toEqual({ 'gpt-image-2': false, 'codex-gpt-image-2': true, 'gpt-image-2.5-sunburst': true })
+    expect(Object.fromEntries(models.map((m: any) => [m.id, m.available]))).toEqual({ 'gpt-image-2': false, 'codex-gpt-image-2': true, 'gpt-image-2.5-sunburst': true, 'gpt-image-2.6-sunburst': true, 'gpt-image-2.6-flare': true })
   })
   test('rejects untrusted image domains and private reference addresses', async () => {
     await expect(validateImageUrl('https://not-allowed.example/image.png')).rejects.toThrow('允许列表')

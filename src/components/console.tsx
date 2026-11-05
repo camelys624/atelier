@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearch } from '@tanstack/react-router'
-import { Code2, KeyRound, Layers2, LayoutDashboard, Loader2, LogOut, Plus, Settings2, Users, WifiOff } from 'lucide-react'
+import { Boxes, Code2, KeyRound, Layers2, LayoutDashboard, Loader2, LogOut, Plus, Settings2, Users, WifiOff } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from './ui/button'
 import { api, type Snapshot } from '@/lib/client'
@@ -14,9 +14,10 @@ import { TaskDetail } from './views/task-detail'
 import { Accounts } from './views/accounts'
 import { CreateKey, Keys } from './views/keys'
 import { SettingsForm } from './views/settings'
+import { Models } from './views/models'
 
-type View = 'overview' | 'accounts' | 'tasks' | 'keys' | 'settings'
-const views = { overview: { title: '运行概览', path: '/', icon: LayoutDashboard }, tasks: { title: '任务队列', path: '/tasks', icon: Layers2 }, accounts: { title: '账号池', path: '/accounts', icon: Users }, keys: { title: 'API 密钥', path: '/keys', icon: KeyRound }, settings: { title: '服务设置', path: '/settings', icon: Settings2 } } as const
+type View = 'overview' | 'accounts' | 'tasks' | 'models' | 'keys' | 'settings'
+const views = { overview: { title: '运行概览', path: '/', icon: LayoutDashboard }, tasks: { title: '任务队列', path: '/tasks', icon: Layers2 }, accounts: { title: '账号池', path: '/accounts', icon: Users }, models: { title: '模型配置', path: '/models', icon: Boxes }, keys: { title: 'API 密钥', path: '/keys', icon: KeyRound }, settings: { title: '服务设置', path: '/settings', icon: Settings2 } } as const
 
 export function Console({ view }: { view: View }) {
   const [data, setData] = useState<Snapshot | null>(null), [authenticated, setAuthenticated] = useState<boolean | null>(null)
@@ -69,13 +70,14 @@ export function Console({ view }: { view: View }) {
         <span role="status" className={cn('topbar-meta ml-auto flex items-center gap-2 text-xs whitespace-nowrap', networkError ? 'text-bad-ink' : 'text-muted-foreground')}><span className={cn('status-dot', networkError && '!bg-bad !shadow-[0_0_0_3px_var(--bad-soft)]')} />{networkError ? '连接已断开' : '服务运行中 · 每 3 秒更新'}</span>
         <div className="flex items-center gap-2 max-[800px]:ml-auto">
           {view === 'overview' && <Button size="sm" variant="outline" asChild><Link to="/keys"><Code2 /><span className="btn-label">API 接入</span></Link></Button>}
-          {view === 'accounts' ? <Button size="sm" onClick={() => setImportOpen(true)}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && <Button size="sm" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
+          {view === 'accounts' ? <Button size="sm" onClick={() => setImportOpen(true)}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && view !== 'models' && <Button size="sm" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
         </div>
       </header>
       {networkError && <div role="alert" className="flex items-center gap-2 border-b border-bad/30 bg-bad-soft px-5 py-2 text-[13px] text-bad-ink"><WifiOff size={15} />与服务的连接已断开，页面数据可能不是最新，正在自动重连…</div>}
       <div className="content">
         {view === 'overview' && <Overview data={data} create={() => setCreateOpen(true)} importAccount={() => setImportOpen(true)} openTask={openTask} createKey={() => setKeyOpen(true)} />}
         {view === 'accounts' && <Accounts data={data} add={() => setImportOpen(true)} action={action} />}
+        {view === 'models' && <Models models={data.configuredModels} responsesModel={data.responsesModel} action={action} />}
         {view === 'tasks' && <Tasks data={data} create={() => setCreateOpen(true)} openTask={openTask} />}
         {view === 'keys' && <Keys data={data} add={() => setKeyOpen(true)} action={action} />}
         {view === 'settings' && <SettingsForm initial={data.settings} reload={load} />}

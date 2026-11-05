@@ -1,6 +1,7 @@
 import { unlink } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { dataDir, getAccount, seal, settings, unseal, db, type Account } from './store'
+import { modelConfiguration } from './image-models'
 
 const children = new Set<ReturnType<typeof Bun.spawn>>()
 class AdapterError extends Error { constructor(message: string, public kind: string) { super(message) } }
@@ -147,7 +148,7 @@ export async function generateImage(account: Account, request: { prompt: string;
   const output = resolve(dataDir, 'spool', `${request.imageId}.${request.attempt}.png`)
   const discard = () => Promise.all([output, output.replace(/\.png$/, '.part')].map(path => unlink(path).catch(() => {})))
   try {
-    const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
+    const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, responses_model: modelConfiguration().responsesModel, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
     updateCredentials(account.id, result.credentials)
     return { path: output, mime: result.mime || 'image/png', bytes: result.bytes }
   } catch (error) {

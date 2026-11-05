@@ -1271,7 +1271,7 @@ def stream_codex_image_outputs(
         images=request.images or [],
         size=request.size,
         quality=request.quality,
-        model=request.model.removeprefix("codex-"),
+        model="gpt-image-2" if request.model == "codex-gpt-image-2" else request.model,
     )
     try:
         for event in events:

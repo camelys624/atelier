@@ -89,6 +89,21 @@
 .row-action { padding: 6px; border-radius: 6px; color: var(--muted-foreground); transition: background-color .15s, color .15s; }
 .row-action:hover:not(:disabled) { background: var(--muted); color: var(--foreground); }
 .row-action:disabled { opacity: .45; cursor: not-allowed; }
+.models-table { min-width: 880px; }
+@media (max-width: 700px) {
+  .models-table { display: block; min-width: 0; }
+  .models-table thead { display: none; }
+  .models-table tbody { display: block; }
+  .models-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding: 16px; }
+  .models-table td { display: block; min-width: 0; max-width: none; padding: 0; }
+  .models-table td:first-child { grid-column: 1 / -1; }
+  .models-table td:nth-child(2) { order: 1; }
+  .models-table td:nth-child(3) { order: 3; grid-column: 1 / -1; }
+  .models-table td:nth-child(4) { order: 2; text-align: right; }
+  .models-table td:last-child { order: 4; grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+  .models-table [data-label]::before { content: attr(data-label); display: block; margin-bottom: 5px; font-size: 11px; color: var(--muted-foreground); }
+  .models-table button { min-width: 36px; min-height: 36px; }
+}
 .animate-spin { animation: spin 1s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .animate-spin { animation-duration: 3s; } * { transition-duration: 0s !important; } }
 @media (max-width: 1100px) { .sidebar { width: 180px; } .main { margin-left: 180px; width: calc(100% - 180px); } }

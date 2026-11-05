@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS device_authorizations (
 );
 CREATE INDEX IF NOT EXISTS idx_device_auth_owner ON device_authorizations(owner,created);
 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), secret TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS image_model_config (
+ id INTEGER PRIMARY KEY CHECK(id=1), models TEXT NOT NULL, default_model TEXT NOT NULL,
+ responses_model TEXT NOT NULL DEFAULT 'gpt-6.1-sol'
+);
 CREATE TABLE IF NOT EXISTS tasks (
  id TEXT PRIMARY KEY, owner TEXT NOT NULL, client_id TEXT, fingerprint TEXT NOT NULL, prompt TEXT NOT NULL,
  model TEXT NOT NULL, n INTEGER NOT NULL, refs TEXT NOT NULL DEFAULT '[]', demo INTEGER NOT NULL DEFAULT 0,
@@ -66,6 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner,created);
 const taskColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(tasks)').all().map(column => column.name))
 if (!taskColumns.has('size')) db.run("ALTER TABLE tasks ADD COLUMN size TEXT NOT NULL DEFAULT '1024x1024'")
 if (!taskColumns.has('quality')) db.run("ALTER TABLE tasks ADD COLUMN quality TEXT NOT NULL DEFAULT 'auto'")
+const modelColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(image_model_config)').all().map(column => column.name))
+if (!modelColumns.has('responses_model')) db.run("ALTER TABLE image_model_config ADD COLUMN responses_model TEXT NOT NULL DEFAULT 'gpt-6.1-sol'")
 const imageColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(images)').all().map(column => column.name))
 if (!imageColumns.has('queued_at')) {
   db.run('ALTER TABLE images ADD COLUMN queued_at INTEGER')

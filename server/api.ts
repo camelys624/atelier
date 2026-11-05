@@ -6,7 +6,8 @@ import { validateImageUrl } from './network'
 import { normalizeAccount, saveAccount } from './accounts'
 import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
-import { IMAGE_MODELS, MODELS, accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference, normalizeSize, normalizeQuality } from './image-input'
+import { accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference, normalizeSize, normalizeQuality } from './image-input'
+import { modelConfiguration, imageModels, defaultImageModel, saveImageModel, saveResponsesModel, setDefaultImageModel, deleteImageModel } from './image-models'
 import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
@@ -40,9 +41,9 @@ function identity(request: Request): Identity {
   throw new HttpError(401, '请登录或使用有效的 API 密钥')
 }
 const usableAccount = (a: Account) => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (a.source !== 'codex' || supportsCodexImages(a.plan))
-function modelList() {
-  const usable = accounts().filter(usableAccount)
-  return MODELS.map(model => ({ ...model, accounts: usable.filter(a => a.source === model.source).length }))
+function modelList(includeDisabled = false) {
+  const usable = accounts().filter(usableAccount), config = modelConfiguration()
+  return config.models.filter(model => includeDisabled || model.enabled).map(model => ({ ...model, isDefault: model.id === config.defaultModel, accounts: usable.filter(a => a.source === model.source).length }))
 }
 function checkOrigin(request: Request) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.headers.has('authorization')) return
@@ -64,13 +65,14 @@ function ownedTask(taskId: string, who: Identity) {
 async function createTask(request: Request, input: any, who: Identity) {
   const prompt = String(input.prompt || '').trim()
   if (!prompt || prompt.length > 12_000) return bad('请输入提示词，最多 12000 字符')
-  const model = String(input.model || 'gpt-image-2')
-  if (!IMAGE_MODELS.includes(model)) return bad(`不支持这个生图模型，可使用 ${IMAGE_MODELS.join('、')}`)
-  const size = normalizeSize(input.size, input.aspect_ratio ?? input.aspectRatio), quality = normalizeQuality(input.quality, model)
+  const model = String(input.model || defaultImageModel())
+  const supported = imageModels().map(item => item.id)
+  if (!supported.includes(model)) return bad(`模型未启用或不存在，可使用 ${supported.join('、')}`)
+  const size = normalizeSize(input.size, input.aspect_ratio ?? input.aspectRatio, model), quality = normalizeQuality(input.quality, model)
   if (input.stream) return bad('第一版提供任务轮询接口，暂不支持流式返回')
   if (input.response_format && !['url', 'b64_json'].includes(input.response_format)) return bad('response_format 只支持 url 或 b64_json')
   if (input.output_format && input.output_format !== 'png') return bad('当前仅支持 output_format=png')
-  for (const field of ['mask', 'background', 'output_compression', 'input_fidelity']) if (input[field] !== undefined) return bad(`当前尚不支持 ${field} 参数`)
+  for (const field of ['complexity', 'mask', 'background', 'output_compression', 'input_fidelity']) if (input[field] !== undefined) return bad(`当前尚不支持 ${field} 参数`)
   const n = integer(input.n, 1, 1, 7)
   const demo = !!input.demo && who.admin
   if (input.demo && !who.admin) throw new HttpError(403, '演示仅用于后台测试')
@@ -135,7 +137,23 @@ export async function handleApi(request: Request): Promise<Response> {
       const counts = db.query<{ status: string; count: number }, []>('SELECT status,COUNT(*) AS count FROM images GROUP BY status').all()
       const delivered = db.query<{ status: string; count: number }, []>("SELECT images.status,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status IN ('success','error') GROUP BY images.status").all()
       const hourly = db.query("SELECT CAST(images.finished/3600000 AS INTEGER)*3600000 AS hour,COUNT(*) AS count FROM images JOIN tasks ON tasks.id=images.task_id WHERE tasks.demo=0 AND images.status='success' AND images.finished>? GROUP BY hour ORDER BY hour").all(Date.now() - 24 * 3600_000)
-      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, models: modelList(), serverTime: Date.now(), baseUrl: baseUrl() })
+      const configuredModels = modelList(true)
+      return json({ accounts: allAccounts.map(publicAccount), tasks: await Promise.all(allTasks.map(serialize)), keys, settings: publicSettings(), counts: Object.fromEntries(counts.map(r => [r.status, r.count])), delivered: Object.fromEntries(delivered.map(r => [r.status, r.count])), hourly, models: configuredModels.filter(model => model.enabled), configuredModels, responsesModel: modelConfiguration().responsesModel, serverTime: Date.now(), baseUrl: baseUrl() })
+    }
+    if (path === '/api/models') {
+      if (request.method === 'GET') return json({ models: modelList(true), responsesModel: modelConfiguration().responsesModel })
+      if (request.method === 'POST') return json(saveImageModel(await body(request)), 201)
+    }
+    if (path === '/api/model-settings' && request.method === 'POST') {
+      const input = await body(request)
+      saveResponsesModel(input?.responsesModel)
+      return json({ ok: true })
+    }
+    const modelMatch = path.match(/^\/api\/models\/([^/]+)(?:\/(default))?$/)
+    if (modelMatch) {
+      if (modelMatch[2] && request.method === 'POST') { setDefaultImageModel(modelMatch[1]); return json({ ok: true }) }
+      if (!modelMatch[2] && request.method === 'PATCH') return json(saveImageModel(await body(request), modelMatch[1]))
+      if (!modelMatch[2] && request.method === 'DELETE') { deleteImageModel(modelMatch[1]); return json({ ok: true }) }
     }
     if (path === '/api/accounts' && request.method === 'POST') {
       const input = await body(request)
@@ -196,7 +214,7 @@ export async function handleApi(request: Request): Promise<Response> {
       saveSettings(value); return json({ ok: true })
     }
     if (path === '/api/settings/test-oss' && request.method === 'POST') return json(await testOss())
-    if (path === '/v1/models') return json({ object: 'list', data: modelList().map(model => ({ id: model.id, object: 'model', owned_by: 'atelier', available: model.accounts > 0 })) })
+    if (path === '/v1/models') return json({ object: 'list', data: modelList().map(model => ({ id: model.id, object: 'model', owned_by: 'atelier', available: model.accounts > 0, source: model.source, sizes: model.sizes, qualities: model.qualities, isDefault: model.isDefault })) })
     if (['/api/tasks', '/v1/image-tasks', '/v1/images/generations', '/v1/images/edits'].includes(path) && request.method === 'POST') {
       const input = await imageBody(request, body)
       const task = await createTask(request, input, who)

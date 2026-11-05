@@ -777,7 +777,7 @@ class OpenAIBackendAPI:
         self._ensure_codex_source_account()
         path = "/backend-api/codex/responses"
         payload = {
-            "model": os.environ.get("CODEX_RESPONSES_MODEL", "").strip() or CODEX_RESPONSES_MODEL,
+            "model": str(getattr(self, "codex_responses_model", "") or "").strip() or CODEX_RESPONSES_MODEL,
             "instructions": CODEX_RESPONSES_INSTRUCTIONS,
             "store": False,
             # Only the small metadata stays in memory; references are encoded into a file below.

@@ -93,14 +93,28 @@ curl https://your-service.example/v1/image-tasks \
 
 - `POST /v1/images/generations`：同步返回，默认 `response_format: "url"`，也支持 `b64_json`。
 - `POST /v1/images/edits`：接受 `multipart/form-data` 的 `image` 单文件或 `image[]` 多文件，以及 JSON 图片地址。默认返回 `data[].b64_json`，可显式设置 `response_format: "url"` 返回存储地址。
-- 支持字段：`model`、`image`、`prompt`、`size`、`quality`、`n`（1～7）、`response_format`。`size` 输出 `auto`、`1024x1024`（默认）、`1536x1024`、`1024x1536` 之一：其他尺寸（如 `1792x1024`、`2048x2048`）、比例（如 `16:9`，也可放在 `aspect_ratio` 字段）都会自动匹配比例最接近的支持尺寸，`2K`/`4K` 等清晰度统一按 1K 输出；`quality` 支持 `auto`（默认）、`low`、`medium`、`high`，Sunburst 另支持 `xhigh`、`max`，其他取值自动降级为最接近的支持值（如 `hd`→`high`、`standard`→`medium`，无法识别时为 `auto`）。当前只输出 PNG，不支持 mask、透明背景、其他输出格式或 SSE。
+- 支持字段：`model`、`image`、`prompt`、`size`、`quality`、`n`（1～7）、`response_format`。内置配置的 `size` 输出 `auto`、`1024x1024`（默认）、`1536x1024`、`1024x1536` 之一：其他尺寸（如 `1792x1024`、`2048x2048`）、比例（如 `16:9`，也可放在 `aspect_ratio` 字段）都会自动匹配比例最接近的支持尺寸，`2K`/`4K` 等清晰度统一按 1K 输出；`quality` 支持 `auto`（默认）、`low`、`medium`、`high`，2.5 Sunburst 和两个 2.6 模型另支持 `xhigh`、`max`，其他取值按模型配置降级（如 `hd`→`high`、`standard`→`medium`，无法识别时为 `auto`，不支持 `auto` 时取配置的第一档）。尺寸和质量可通过下述模型配置调整。当前只输出 PNG，不支持 complexity、mask、透明背景、其他输出格式或 SSE。
 - 上述两个同步接口也接受 `async: true` 返回 HTTP 202 的任务对象，这是本服务的扩展。
 - 同步等待最多 180 秒。超时返回 HTTP 504 和 `task_id`；后台任务继续执行，应查询已有任务，勿直接重新提交。
 - `POST /v1/image-tasks/{id}/retry`：重试失败图片；已有暂存结果仅重传。已取消任务不可重试。
 - `POST /v1/image-tasks/{id}/cancel`：取消尚未开始的图片；正在生成的图片仍完成并保存。
-- `GET /v1/models`：`gpt-image-2`（网页来源）、`codex-gpt-image-2`（Codex 来源，使用上游 `gpt-image-2`）和 `gpt-image-2.5-sunburst`（Codex 来源，原样传递模型名）。上游是否允许 Sunburst 取决于账号与提供方能力，接口兼容并不代表账号已获得该模型权限。
+- `GET /v1/models`：默认返回 `gpt-image-2`（网页来源）、`codex-gpt-image-2`（Codex 来源，使用上游 `gpt-image-2`）、`gpt-image-2.5-sunburst`、`gpt-image-2.6-sunburst` 和 `gpt-image-2.6-flare`（后三者为 Codex 来源，原样传递模型名）。每个条目包含 `source`、`sizes`、`qualities`。`available` 仅表示有可用的对应来源账号，不代表已逐一验证该账号的模型权限。
 
-Codex 链路内部使用 `gpt-6.1-sol` 调用图片工具，可通过服务端环境变量 `CODEX_RESPONSES_MODEL` 修改，重启后生效。客户端 `model` 字段仍然传图片模型（例如 `gpt-image-2.5-sunburst`），不需要改成文本模型。旧版写死的 `gpt-5.5` 已不适用于 ChatGPT 登录的 Codex；参考[官方模型说明](https://learn.chatgpt.com/docs/models?surface=web)。
+### 配置生图模型
+
+登录管理后台，打开侧栏的「模型配置」页面，即可管理模型，无需修改配置文件或重启服务。配置保存在 SQLite 数据库中，刷新网页或重启后仍然保留。首次使用会自动初始化上述五个模型，默认模型为 `gpt-image-2`。
+
+- 点击「添加模型」填写模型 ID、显示名称、账号来源、支持的尺寸与质量档位，以及可选说明。模型 ID 使用账号支持的实际上游名称。
+- 点击行内的编辑按钮修改名称、说明、尺寸和质量档位。模型 ID 和账号来源在编辑时固定；如需更换，请添加新模型。
+- 点击「设为默认」后，API 请求省略 `model` 时使用该模型；后台创建任务优先选择有可用账号的默认模型。
+- 停用的模型会从任务创建和 `/v1/models` 列表中隐藏，不接受新任务。已排队和执行中的任务继续使用原模型，历史记录和重试不受影响。删除模型同样保留已有任务。
+- 默认模型必须保持启用。如需停用或删除，请先将其他启用的模型设为默认。
+
+尺寸每行一个，也可用逗号分隔，第一个明确尺寸是默认值。宽高须为 16 的倍数、比例介于 1:3～3:1，至少填写一个明确尺寸；可加 `auto`。精确命中配置的尺寸时直接传递，其他尺寸或比例匹配比例最接近的一项。质量可勾选 `auto/low/medium/high/xhigh/max`，至少选择一档。不支持的质量优先降至较低的已配置档位，无法识别时使用 `auto`，未启用 `auto` 时使用第一档。配置的能力须符合实际账号和上游支持范围。网页协议当前仅识别 `gpt-image-2`，其他模型只允许 Codex 来源。默认的 2.6 模型质量档位参考 [OpenAI 官方图片提示指南](https://developers.openai.com/api/docs/guides/image-prompting)。
+
+页面底部的「Codex 调用设置」管理负责调用图片工具的文本模型，初始值为 `gpt-6.1-sol`。保存后，新发起的生成请求使用更新后的值；已发起的请求不受影响。客户端 `model` 字段继续填写生图模型，例如 `gpt-image-2.6-flare`。
+
+模型管理接口仅限管理员：`GET/POST /api/models`、`PATCH/DELETE /api/models/{id}`、`POST /api/models/{id}/default`，以及保存内部调用模型的 `POST /api/model-settings`（请求体为 `{"responsesModel":"gpt-6.1-sol"}`）。业务密钥只可读取已启用的 `/v1/models`，不能修改配置。无效配置会返回具体错误，不会覆盖已保存的值。
 
 Codex 请求复用适配器已有的 curl_cffi 客户端，以使用一致的 TLS、压缩解码和代理设置；不会在连接异常后自动重复发起出图请求。
 

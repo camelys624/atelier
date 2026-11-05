@@ -14,7 +14,6 @@ services:
       PYTHON_BIN: python3
       DATA_DIR: /app/data
       CODEX_OAUTH_CLIENT_ID: ${CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}
-      CODEX_RESPONSES_MODEL: ${CODEX_RESPONSES_MODEL:-gpt-6.1-sol}
       IMAGE_RETENTION_HOURS: ${IMAGE_RETENTION_HOURS:-24}
     volumes:
       - atelier_data:/app/data

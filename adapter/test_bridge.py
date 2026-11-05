@@ -59,7 +59,7 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend.iter_codex_image_response_events.return_value = iter([{'type': 'image_generation_call', 'result': base64.b64encode(raw).decode()}])
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'result.png'
-            payload = {'action': 'generate', 'account': {'source_type': 'codex', 'access_token': 'fake-test-token'}, 'model': 'gpt-image-2.5-sunburst', 'prompt': 'combine three references', 'size': '1536x1024', 'quality': 'high', 'images': images, 'output': str(output)}
+            payload = {'action': 'generate', 'account': {'source_type': 'codex', 'access_token': 'fake-test-token'}, 'model': 'gpt-image-2.5-sunburst', 'responses_model': 'configured-calling-model', 'prompt': 'combine three references', 'size': '1536x1024', 'quality': 'high', 'images': images, 'output': str(output)}
             with patch.object(openai_backend_api, 'OpenAIBackendAPI', return_value=backend), patch('sys.stdin', io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(io.StringIO()) as stdout:
                 runpy.run_path(str(Path(__file__).with_name('bridge.py')))
             result = json.loads(stdout.getvalue())
@@ -67,12 +67,12 @@ class ImageEditProtocolTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), raw)
         backend.iter_codex_image_response_events.assert_called_once_with(prompt='combine three references', images=images, size='1536x1024', quality='high', model='gpt-image-2.5-sunburst')
         backend.close.assert_called_once()
+        self.assertEqual(backend.codex_responses_model, 'configured-calling-model')
 
     def test_tool_payload_uses_requested_model_and_edit_settings(self):
         backend = self.backend()
         backend._iter_codex_response_events = Mock(return_value=iter([]))
-        with patch.dict(os.environ, {'CODEX_RESPONSES_MODEL': ''}):
-            list(backend.iter_codex_image_response_events(prompt='combine', images=['data:image/png;base64,first', 'data:image/png;base64,second'], size='1536x1024', quality='high', model='gpt-image-2.5-sunburst'))
+        list(backend.iter_codex_image_response_events(prompt='combine', images=['data:image/png;base64,first', 'data:image/png;base64,second'], size='1536x1024', quality='high', model='gpt-image-2.5-sunburst'))
         payload = backend.sent_payload
         self.assertEqual(payload['model'], 'gpt-6.1-sol')
         self.assertEqual(payload['tools'][0], {'type': 'image_generation', 'model': 'gpt-image-2.5-sunburst', 'action': 'edit', 'size': '1536x1024', 'quality': 'high', 'output_format': 'png'})
@@ -83,8 +83,8 @@ class ImageEditProtocolTests(unittest.TestCase):
     def test_internal_model_can_be_configured_without_changing_the_image_model(self):
         backend = self.backend()
         backend._iter_codex_response_events = Mock(return_value=iter([]))
-        with patch.dict(os.environ, {'CODEX_RESPONSES_MODEL': ' custom-account-model '}):
-            list(backend.iter_codex_image_response_events(prompt='test', model='gpt-image-2.5-sunburst'))
+        backend.codex_responses_model = ' custom-account-model '
+        list(backend.iter_codex_image_response_events(prompt='test', model='gpt-image-2.5-sunburst'))
         payload = backend.sent_payload
         self.assertEqual(payload['model'], 'custom-account-model')
         self.assertEqual(payload['tools'][0]['model'], 'gpt-image-2.5-sunburst')
@@ -257,6 +257,15 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend.iter_codex_image_response_events.return_value = iter([{'type': 'image_generation_call', 'result': 'dGVzdA=='}])
         list(conversation.stream_codex_image_outputs(backend, conversation.ConversationRequest(model='codex-gpt-image-2', prompt='legacy')))
         self.assertEqual(backend.iter_codex_image_response_events.call_args.kwargs['model'], 'gpt-image-2')
+
+    def test_new_and_custom_image_models_are_forwarded_without_rewriting(self):
+        from services.protocol import conversation
+        for model in ('gpt-image-2.6-sunburst', 'gpt-image-2.6-flare', 'codex-future-image'):
+            with self.subTest(model=model):
+                backend = Mock()
+                backend.iter_codex_image_response_events.return_value = iter([{'type': 'image_generation_call', 'result': 'dGVzdA=='}])
+                list(conversation.stream_codex_image_outputs(backend, conversation.ConversationRequest(model=model, prompt='test', size='1536x864', quality='max')))
+                backend.iter_codex_image_response_events.assert_called_once_with(prompt='test', images=[], size='1536x864', quality='max', model=model)
 
     def test_retries_transient_tls_only_for_account_validation(self):
         from services import openai_backend_api

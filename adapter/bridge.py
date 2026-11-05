@@ -142,6 +142,7 @@ def execute(request=None):
     if not WORKER: token = current
     from services.openai_backend_api import OpenAIBackendAPI
     backend = OpenAIBackendAPI(current)
+    backend.codex_responses_model = request.get('responses_model')
     try:
         if request.get('action') == 'refresh':
             # Only read-only account checks are retried. Never replay image generation.

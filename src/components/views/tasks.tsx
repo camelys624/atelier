@@ -66,7 +66,7 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
   const anyReady = data.accounts.some(a => a.status === 'ready')
   const [prompt, setPrompt] = useState(''), [model, setModel] = useState(() => preferredModel(data.models)), [n, setN] = useState(7), [urls, setUrls] = useState(''), [demo, setDemo] = useState(!anyReady), [busy, setBusy] = useState(false)
   // Reopening the dialog moves off a model whose accounts are gone, so the default always has a usable account.
-  useEffect(() => { if (!open) return; if (!anyReady) setDemo(true); if (!data.models.find(m => m.id === model)?.accounts) setModel(preferredModel(data.models)) }, [open])
+  useEffect(() => { if (!open) return; if (!anyReady) setDemo(true); if (!data.models.find(m => m.id === model)?.accounts) setModel(preferredModel(data.models)) }, [open, anyReady, data.models, model])
   const selected = data.models.find(m => m.id === model), source = selected?.source || 'codex', usable = selected?.accounts || 0
   const ready = data.accounts.filter(a => a.source === source && a.status === 'ready')
   const free = ready.reduce((sum, a) => sum + Math.max(0, a.slots - a.inflight), 0)
