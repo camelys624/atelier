@@ -26,6 +26,55 @@ class RefreshMetadataTests(unittest.TestCase):
         with patch('curl_cffi.requests.post') as post:
             self.assertEqual(ctx['refreshed_account']()['access_token'],'opaque-valid-token')
             post.assert_not_called()
+    def test_invalidated_unexpired_token_can_recover_without_reimport(self):
+        ctx = self.context({})
+        from services import openai_backend_api
+        credentials = {'access_token': 'unexpired-but-invalidated', 'refresh_token': 'valid-refresh', 'expires_at': 9999999999}
+        rejected, recovered = Mock(), Mock()
+        rejected.get_user_info.side_effect = openai_backend_api.InvalidAccessTokenError('token invalidated (/backend-api/me)')
+        recovered.get_user_info.return_value = {'email': 'test@example.com', 'type': 'Plus', 'quota': 10}
+        response = Mock(status_code=200)
+        response.json.return_value = {'access_token': 'recovered-access', 'refresh_token': 'rotated-refresh', 'expires_in': 7200}
+        with patch.object(openai_backend_api, 'OpenAIBackendAPI', side_effect=[rejected, recovered]), patch('curl_cffi.requests.post', return_value=response) as post:
+            result = ctx['handle']({'action': 'refresh', 'account': credentials})
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertEqual(result['credentials']['refresh_token'], 'rotated-refresh')
+        post.assert_called_once()
+    def test_repeated_401_renews_only_once_and_keeps_rotated_credentials(self):
+        ctx = self.context({})
+        from services import openai_backend_api
+        backend = Mock()
+        backend.get_user_info.side_effect = openai_backend_api.InvalidAccessTokenError('token invalidated (/backend-api/me)')
+        response = Mock(status_code=200)
+        response.json.return_value = {'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 7200}
+        request = {'action': 'refresh', 'accountId': 'test', 'account': {'access_token': 'old-access', 'refresh_token': 'old-refresh', 'expires_at': 9999999999}}
+        with patch.object(openai_backend_api, 'OpenAIBackendAPI', return_value=backend), patch('curl_cffi.requests.post', return_value=response) as post:
+            result = ctx['handle'](request)
+        self.assertFalse(result['ok'])
+        self.assertIn('token invalidated', result['error'])
+        self.assertEqual(result['credentials']['refresh_token'], 'new-refresh')
+        self.assertEqual(backend.get_user_info.call_count, 2)
+        post.assert_called_once()
+        self.assertEqual(ctx['_accounts'], {})
+    def test_generation_uses_prepared_credentials_without_refresh_or_replay(self):
+        ctx = self.context({})
+        from services import openai_backend_api
+        backend = Mock()
+        backend.iter_codex_image_response_events.side_effect = openai_backend_api.InvalidAccessTokenError('token invalidated (/backend-api/codex/responses)')
+        request = {'action': 'generate', 'accountId': 'test', 'account': {'source_type': 'codex', 'access_token': 'prepared-access', 'refresh_token': 'refresh', 'expires_at': 1}, 'prompt': 'test', 'model': 'codex-gpt-image-2'}
+        with patch.object(openai_backend_api, 'OpenAIBackendAPI', return_value=backend), patch('curl_cffi.requests.post') as post:
+            result = ctx['handle'](request)
+        self.assertFalse(result['ok'])
+        self.assertIn('token invalidated', result['error'])
+        backend.iter_codex_image_response_events.assert_called_once()
+        post.assert_not_called()
+    def test_rotated_token_without_expires_in_uses_its_own_jwt_expiry(self):
+        ctx = self.context({'access_token': 'old-access', 'refresh_token': 'refresh', 'expires_at': 1})
+        jwt = 'header.' + base64.urlsafe_b64encode(json.dumps({'exp': 9999999999}).encode()).decode().rstrip('=') + '.signature'
+        response = Mock(status_code=200)
+        response.json.return_value = {'access_token': jwt}
+        with patch('curl_cffi.requests.post', return_value=response):
+            self.assertEqual(ctx['refreshed_account']()['expires_at'], 9999999999)
 class ImageEditProtocolTests(unittest.TestCase):
     def setUp(self):
         with patch('sys.stdin', io.StringIO(json.dumps({'action': 'probe'}))), contextlib.redirect_stdout(io.StringIO()):

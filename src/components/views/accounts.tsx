@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Pause, Play, RefreshCw, Search, ShieldCheck, Trash2, Upload, Users } from 'lucide-react'
+import { KeyRound, Pause, Play, RefreshCw, Search, ShieldCheck, Trash2, Upload, Users } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { MAX_ACCOUNT_SLOTS, type Account, type Snapshot } from '@/lib/client'
@@ -22,7 +22,7 @@ function SlotsInput({ account, disabled, save }: { account: Account; disabled: b
     onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); if (e.key === 'Escape') { setDraft(String(account.slots)); setEditing(false); e.currentTarget.blur() } }} />
 }
 
-export function Accounts({ data, add, action }: { data: Snapshot; add: () => void; action: Action }) {
+export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; add: () => void; reauthorize: (account: Account) => void; action: Action }) {
   const [filter, setFilter] = useState<Filter>('all'), [query, setQuery] = useState(''), [busy, setBusy] = useState<string | null>(null), [remove, setRemove] = useState<Account | null>(null)
   const q = query.trim().toLowerCase()
   const rows = data.accounts.filter(a => (filter === 'all' || a.source === filter) && `${a.name} ${a.email || ''}`.toLowerCase().includes(q))
@@ -60,6 +60,7 @@ export function Accounts({ data, add, action }: { data: Snapshot; add: () => voi
               <SlotsInput account={account} disabled={busy === account.id} save={slots => run(account, `/api/accounts/${account.id}`, { slots }, 'PATCH', `并发上限已设为 ${slots}`)} />
             </div><div className="meter w-[104px]"><span style={{ width: `${Math.min(100, account.inflight / account.slots * 100)}%` }} /></div></td>
             <td className="px-3 py-2.5"><div className="flex justify-end gap-1">
+              <Button size="sm" variant="ghost" className="h-8 shrink-0 px-2 text-xs" aria-label={`${account.source === 'codex' ? '重新授权' : '更新凭证'}${account.name}`} title={account.inflight ? '请等待正在生成的图片完成' : '更新登录凭证，保留账号设置和历史统计'} disabled={working || account.inflight > 0} onClick={() => reauthorize(account)}><KeyRound size={14} />{account.source === 'codex' ? '重新授权' : '更新凭证'}</Button>
               <button className="row-action" aria-label={`验证${account.name}`} title="验证与刷新" disabled={working} onClick={() => void run(account, `/api/accounts/${account.id}/refresh`, {}, undefined, '账号验证完成')}><RefreshCw size={15} className={working ? 'animate-spin' : ''} /></button>
               <button className="row-action" aria-label={disabled ? `启用${account.name}` : `停用${account.name}`} title={disabled ? '启用' : '停用'} disabled={busy === account.id} onClick={() => void run(account, `/api/accounts/${account.id}`, { enabled: disabled }, 'PATCH', disabled ? '账号已启用' : '账号已停用')}>{disabled ? <Play size={15} /> : <Pause size={15} />}</button>
               <button className="row-action hover:!text-red-600" aria-label={`删除${account.name}`} title="删除" onClick={() => setRemove(account)}><Trash2 size={15} /></button>

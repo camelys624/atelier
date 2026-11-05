@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { Boxes, Code2, KeyRound, Layers2, LayoutDashboard, Loader2, LogOut, Plus, Settings2, Users, WifiOff } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from './ui/button'
-import { api, type Snapshot } from '@/lib/client'
+import { api, type Account, type Snapshot } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { AccountImportDialog as ImportAccounts } from './account-import'
 import { Brand, type Action } from './views/shared'
@@ -22,6 +22,7 @@ const views = { overview: { title: '运行概览', path: '/', icon: LayoutDashbo
 export function Console({ view }: { view: View }) {
   const [data, setData] = useState<Snapshot | null>(null), [authenticated, setAuthenticated] = useState<boolean | null>(null)
   const [createOpen, setCreateOpen] = useState(false), [importOpen, setImportOpen] = useState(false), [keyOpen, setKeyOpen] = useState(false)
+  const [reauthorizeAccount, setReauthorizeAccount] = useState<Account | null>(null)
   const [networkError, setNetworkError] = useState(false)
   const mounted = useRef(true), loading = useRef(false)
   const navigate = useNavigate(), detail = (useSearch({ strict: false }) as { task?: string }).task
@@ -46,6 +47,7 @@ export function Console({ view }: { view: View }) {
   async function logout() {
     try { await api('/api/auth/logout', {}); setAuthenticated(false); setData(null) } catch (error: any) { toast.error(error.message) }
   }
+  function openImport(account: Account | null = null) { setReauthorizeAccount(account); setImportOpen(true) }
   if (authenticated === false) return <Login onSuccess={() => void load()} />
   if (!data) return <div className="grid min-h-screen place-items-center"><div className="text-center"><Brand /><p className="mt-8 flex items-center justify-center gap-2 text-[13px] text-muted-foreground"><Loader2 className="size-4 animate-spin" />{networkError ? '无法连接服务，正在重试…' : '正在加载…'}</p></div></div>
   const meta = views[view], active = (data.counts.generating || 0) + (data.counts.uploading || 0), queued = data.counts.queued || 0
@@ -70,13 +72,13 @@ export function Console({ view }: { view: View }) {
         <span role="status" className={cn('topbar-meta ml-auto flex items-center gap-2 text-xs whitespace-nowrap', networkError ? 'text-bad-ink' : 'text-muted-foreground')}><span className={cn('status-dot', networkError && '!bg-bad !shadow-[0_0_0_3px_var(--bad-soft)]')} />{networkError ? '连接已断开' : '服务运行中 · 每 3 秒更新'}</span>
         <div className="flex items-center gap-2 max-[800px]:ml-auto">
           {view === 'overview' && <Button size="sm" variant="outline" asChild><Link to="/keys"><Code2 /><span className="btn-label">API 接入</span></Link></Button>}
-          {view === 'accounts' ? <Button size="sm" onClick={() => setImportOpen(true)}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && view !== 'models' && <Button size="sm" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
+          {view === 'accounts' ? <Button size="sm" onClick={() => openImport()}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && view !== 'models' && <Button size="sm" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
         </div>
       </header>
       {networkError && <div role="alert" className="flex items-center gap-2 border-b border-bad/30 bg-bad-soft px-5 py-2 text-[13px] text-bad-ink"><WifiOff size={15} />与服务的连接已断开，页面数据可能不是最新，正在自动重连…</div>}
       <div className="content">
-        {view === 'overview' && <Overview data={data} create={() => setCreateOpen(true)} importAccount={() => setImportOpen(true)} openTask={openTask} createKey={() => setKeyOpen(true)} />}
-        {view === 'accounts' && <Accounts data={data} add={() => setImportOpen(true)} action={action} />}
+        {view === 'overview' && <Overview data={data} create={() => setCreateOpen(true)} importAccount={() => openImport()} openTask={openTask} createKey={() => setKeyOpen(true)} />}
+        {view === 'accounts' && <Accounts data={data} add={() => openImport()} reauthorize={openImport} action={action} />}
         {view === 'models' && <Models models={data.configuredModels} responsesModel={data.responsesModel} action={action} />}
         {view === 'tasks' && <Tasks data={data} create={() => setCreateOpen(true)} openTask={openTask} />}
         {view === 'keys' && <Keys data={data} add={() => setKeyOpen(true)} action={action} />}
@@ -84,7 +86,7 @@ export function Console({ view }: { view: View }) {
       </div>
     </main>
     <CreateTask open={createOpen} onOpenChange={setCreateOpen} data={data} complete={async task => { await load(); openTask(task.id) }} />
-    <ImportAccounts open={importOpen} onOpenChange={setImportOpen} complete={load} />
+    {importOpen && <ImportAccounts key={reauthorizeAccount?.id || 'new'} open onOpenChange={setImportOpen} complete={load} account={reauthorizeAccount} />}
     <CreateKey open={keyOpen} onOpenChange={setKeyOpen} complete={load} />
     <TaskDetail now={data.serverTime} id={detail} listed={data.tasks.find(t => t.id === detail)} open={!!detail && (view === 'overview' || view === 'tasks')} onOpenChange={value => !value && closeTask()} action={action} />
   </div>

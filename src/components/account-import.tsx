@@ -1,19 +1,19 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Check, CheckCheck, ChevronRight, Copy, ExternalLink, FileJson, KeyRound, Loader2, RefreshCw, ShieldCheck, Upload, X } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, type DeviceAuthorization } from '@/lib/client'
+import { api, type Account, type DeviceAuthorization } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Input, Textarea } from './ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
 
-const cacheKey = 'atelier_device_authorization'
 const isPending = (session: DeviceAuthorization | null) => !!session && ['pending', 'exchanging'].includes(session.status)
-export function AccountImportDialog({ open, onOpenChange, complete }: { open: boolean; onOpenChange: (value: boolean) => void; complete: () => Promise<void> }) {
-  const [mode, setMode] = useState<'authorize' | 'manual'>('authorize')
+export function AccountImportDialog({ open, onOpenChange, complete, account = null }: { open: boolean; onOpenChange: (value: boolean) => void; complete: () => Promise<void>; account?: Account | null }) {
+  const cacheKey = `atelier_device_authorization${account ? `:${account.id}` : ''}`
+  const [mode, setMode] = useState<'authorize' | 'manual'>(account?.source === 'web' ? 'manual' : 'authorize')
   const [session, setSession] = useState<DeviceAuthorization | null>(null)
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [now, setNow] = useState(Date.now())
-  const [source, setSource] = useState('web'), [items, setItems] = useState('')
+  const [source, setSource] = useState(account?.source || 'web'), [items, setItems] = useState('')
   const file = useRef<HTMLInputElement>(null), openRef = useRef(open), sessionRef = useRef(session), completed = useRef('')
   openRef.current = open; sessionRef.current = session
   function remember(value: DeviceAuthorization) {
@@ -23,12 +23,17 @@ export function AccountImportDialog({ open, onOpenChange, complete }: { open: bo
   }
   useEffect(() => {
     if (!open) return
+    openRef.current = true
     let disposed = false
     const existing = sessionStorage.getItem(cacheKey)
-    if (existing) void api<DeviceAuthorization>(`/api/accounts/authorize/${existing}`).then(value => { if (!disposed) remember(value) }).catch(() => { sessionStorage.removeItem(cacheKey) })
+    if (existing) void api<DeviceAuthorization>(`/api/accounts/authorize/${existing}`).then(value => {
+      if (disposed) return
+      if ((value.targetAccountId || null) === (account?.id || null) && isPending(value)) remember(value)
+      else sessionStorage.removeItem(cacheKey)
+    }).catch(() => { sessionStorage.removeItem(cacheKey) })
     const timer = setInterval(() => setNow(Date.now()), 1000)
-    return () => { disposed = true; clearInterval(timer) }
-  }, [open])
+    return () => { disposed = true; openRef.current = false; clearInterval(timer) }
+  }, [open, cacheKey])
   useEffect(() => {
     if (!open || !session || !isPending(session)) return
     let disposed = false, timer: ReturnType<typeof setTimeout>
@@ -37,7 +42,7 @@ export function AccountImportDialog({ open, onOpenChange, complete }: { open: bo
         const value = await api<DeviceAuthorization>(`/api/accounts/authorize/${session!.id}`)
         if (disposed) return
         remember(value); setError('')
-        if (value.status === 'success' && completed.current !== value.id) { completed.current = value.id; await complete(); toast.success('授权完成，账号凭证已加密保存') }
+        if (value.status === 'success' && completed.current !== value.id) { completed.current = value.id; await complete(); toast.success(account ? '重新授权完成，原账号凭证已更新' : '授权完成，账号凭证已加密保存') }
         if (isPending(value)) timer = setTimeout(poll, 2000)
       } catch (error: any) {
         if (disposed) return
@@ -62,7 +67,7 @@ export function AccountImportDialog({ open, onOpenChange, complete }: { open: bo
     setBusy(true); setError('')
     try {
       if (isPending(sessionRef.current)) await cancelPending()
-      const value = await api<DeviceAuthorization>('/api/accounts/authorize', {})
+      const value = await api<DeviceAuthorization>('/api/accounts/authorize', account ? { accountId: account.id } : {})
       if (!openRef.current) { await api(`/api/accounts/authorize/${value.id}`, undefined, 'DELETE'); return }
       remember(value)
     } catch (error: any) { if (openRef.current) setError(error.message) }
@@ -74,7 +79,7 @@ export function AccountImportDialog({ open, onOpenChange, complete }: { open: bo
   }
   async function submit(event: FormEvent) {
     event.preventDefault(); setBusy(true)
-    try { const result = await api('/api/accounts', { source, items }); toast.success(`新增 ${result.added} 个账号，更新 ${result.updated} 个账号`); setItems(''); onOpenChange(false); await complete() }
+    try { const result = await api('/api/accounts', { source, items, ...(account ? { accountId: account.id } : {}) }); toast.success(account ? '账号凭证已更新，正在验证' : `新增 ${result.added} 个账号，更新 ${result.updated} 个账号`); setItems(''); onOpenChange(false); await complete() }
     catch (error: any) { toast.error(error.message) }
     finally { setBusy(false) }
   }
@@ -82,31 +87,31 @@ export function AccountImportDialog({ open, onOpenChange, complete }: { open: bo
   const succeeded = session?.status === 'success'
   const failed = session && ['failed', 'expired', 'cancelled'].includes(session.status)
   return <Dialog open={open} onOpenChange={value => value ? onOpenChange(true) : void close()}><DialogContent className="!max-w-[590px]">
-    <DialogTitle className="text-xl font-semibold">添加账号</DialogTitle>
-    <DialogDescription className="mt-2 text-xs leading-6 text-muted-foreground">通过官方页面授权，登录完成后自动加入账号池。</DialogDescription>
-    <div className="mb-6 mt-6 flex gap-5 border-b text-xs">
+    <DialogTitle className="text-xl font-semibold">{account ? account.source === 'codex' ? '重新授权账号' : '更新账号凭证' : '添加账号'}</DialogTitle>
+    <DialogDescription className="mt-2 text-xs leading-6 text-muted-foreground">{account ? <>为「{account.email || account.name}」更新登录凭证。账号设置和历史统计会保留，无需删除账号。</> : '通过官方页面授权，登录完成后自动加入账号池。'}</DialogDescription>
+    {account?.source !== 'web' && <div className="mb-6 mt-6 flex gap-5 border-b text-xs">
       {[['authorize', '授权登录'], ['manual', '手动导入']].map(([value, title]) => <button key={value} type="button" disabled={busy} onClick={async () => { if (value === mode) return; try { await cancelPending(); setError(''); setMode(value as typeof mode) } catch { toast.error('请先取消当前授权，再切换方式') } }} className={cn('flex items-center gap-2 border-b-2 pb-3 transition-colors', mode === value ? 'border-accent font-semibold text-accent-text' : 'border-transparent text-muted-foreground')}>{value === 'authorize' ? <KeyRound size={13} /> : <FileJson size={13} />}{title}{value === 'authorize' && <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent-text">推荐</span>}</button>)}
-    </div>
+    </div>}
     {mode === 'authorize' ? <div>
-      {succeeded ? <div className="py-4 text-center"><span className="mx-auto mb-5 flex size-14 items-center justify-center rounded-full bg-ok-soft text-ok-ink"><CheckCheck size={25} /></span><h3 className="text-lg font-medium">授权已完成</h3><p className="mt-2 text-sm text-ok-ink">{session.accountName || '账号已加入号池'}</p><p className="mx-auto mt-3 max-w-80 text-[13px] leading-6 text-muted-foreground">登录与续期凭证已加密保存。<br />{session.accountStatus === 'ready' ? '账号验证已完成，可以参与 Codex 图片任务。' : session.accountStatus === 'error' ? '上游可用性验证未通过，请在账号池查看原因并刷新。' : session.accountStatus === 'disabled' ? '这个账号仍保持停用状态，可在账号池中启用。' : '正在继续验证账号套餐与图片权限，请在账号池查看状态。'}</p><Button className="mt-6" onClick={async () => { await complete(); void close() }}>查看账号池<ChevronRight /></Button></div>
+      {succeeded ? <div className="py-4 text-center"><span className="mx-auto mb-5 flex size-14 items-center justify-center rounded-full bg-ok-soft text-ok-ink"><CheckCheck size={25} /></span><h3 className="text-lg font-medium">授权已完成</h3><p className="mt-2 text-sm text-ok-ink">{session.accountName || (account ? '原账号凭证已更新' : '账号已加入账号池')}</p><p className="mx-auto mt-3 max-w-80 text-[13px] leading-6 text-muted-foreground">{account ? '新的登录与续期凭证已保存，账号设置和历史统计已保留。' : '登录与续期凭证已加密保存。'}<br />{session.accountStatus === 'ready' ? '账号验证已完成，可以参与 Codex 图片任务。' : session.accountStatus === 'error' ? '上游可用性验证未通过，请在账号池查看原因并刷新。' : session.accountStatus === 'disabled' ? '这个账号仍保持停用状态，可在账号池中启用。' : '正在继续验证账号套餐与图片权限，请在账号池查看状态。'}</p><Button className="mt-6" onClick={async () => { await complete(); void close() }}>查看账号池<ChevronRight /></Button></div>
       : <>
-        <div className="flex items-start gap-3 rounded-xl border border-border bg-accent-soft p-4"><span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent-text"><ShieldCheck size={17} /></span><div><p className="text-xs font-medium text-accent-text">Codex 设备码授权</p><p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">在 OpenAI 官方页面登录并确认。凭证将加密保存在本服务，作为 Codex 账号参与调度。</p></div></div>
+        <div className="flex items-start gap-3 rounded-xl border border-border bg-accent-soft p-4"><span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent-text"><ShieldCheck size={17} /></span><div><p className="text-xs font-medium text-accent-text">Codex 设备码授权</p><p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">{account ? `请在官方页面登录 ${account.email || account.name} 并确认，完成后自动更新这个账号的凭证。` : '在 OpenAI 官方页面登录并确认。凭证将加密保存在本服务，作为 Codex 账号参与调度。'}</p></div></div>
         {session && isPending(session) ? <div className="mt-6">
           <div className="mb-3 flex items-center justify-between text-[13px]"><span className="text-soft">在官方页面输入这组一次性设备码</span><span className="font-mono text-muted-foreground">{Math.floor(seconds / 60).toString().padStart(2, '0')}:{(seconds % 60).toString().padStart(2, '0')} 后过期</span></div>
           <div className="flex items-center justify-between rounded-xl border bg-surface px-5 py-5"><code className="font-mono text-[29px] font-semibold tracking-[5px] text-foreground">{session.userCode}</code><Button size="icon" variant="ghost" aria-label="复制设备码" onClick={() => void copyCode()}><Copy /></Button></div>
           <Button className="mt-4 w-full" asChild><a href={session.verificationUrl} target="_blank" rel="noopener noreferrer"><ExternalLink />打开官方授权页面</a></Button>
           <p className="mt-2 text-center font-mono text-[11px] text-muted-foreground">auth.openai.com/codex/device</p>
-          <div role="status" className="mt-6 flex items-center justify-center gap-2 rounded-lg bg-muted px-4 py-3 text-[13px] text-muted-foreground"><Loader2 size={13} className="animate-spin" />{session.status === 'exchanging' ? '正在验证并保存账号，请稍候…' : '等待你在官方页面完成授权，完成后会自动导入'}</div>
-        </div> : <div className="mt-5 space-y-4">{failed && <div role="alert" className="rounded-lg border border-warn/40 bg-warn-soft p-4 text-xs leading-6 text-warn-ink">{session.error || '本次授权已结束，请重新开始'}</div>}<ol className="space-y-4 py-2 text-[13px] text-muted-foreground">{['获取一次性设备码，打开官方授权页面', '登录你要添加的账号，输入设备码并确认授权', '返回这里，系统自动验证并加入账号池'].map((text, i) => <li key={text} className="flex items-center gap-3"><span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border text-[11px] text-muted-foreground">{i + 1}</span>{text}</li>)}</ol><Button className="w-full" disabled={busy} onClick={() => void begin()}>{busy ? <Loader2 className="animate-spin" /> : failed ? <RefreshCw /> : <KeyRound />}{busy ? '正在获取设备码…' : failed ? '重新获取设备码' : '获取设备码'}</Button></div>}
+          <div role="status" className="mt-6 flex items-center justify-center gap-2 rounded-lg bg-muted px-4 py-3 text-[13px] text-muted-foreground"><Loader2 size={13} className="animate-spin" />{session.status === 'exchanging' ? '正在验证并保存账号，请稍候…' : account ? '等待你完成授权，完成后自动更新原账号' : '等待你在官方页面完成授权，完成后会自动导入'}</div>
+        </div> : <div className="mt-5 space-y-4">{failed && <div role="alert" className="rounded-lg border border-warn/40 bg-warn-soft p-4 text-xs leading-6 text-warn-ink">{session.error || '本次授权已结束，请重新开始'}</div>}<ol className="space-y-4 py-2 text-[13px] text-muted-foreground">{['获取一次性设备码，打开官方授权页面', account ? '登录当前账号，输入设备码并确认授权' : '登录你要添加的账号，输入设备码并确认授权', account ? '返回这里，系统更新原账号凭证并重新验证' : '返回这里，系统自动验证并加入账号池'].map((text, i) => <li key={text} className="flex items-center gap-3"><span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border text-[11px] text-muted-foreground">{i + 1}</span>{text}</li>)}</ol><Button className="w-full" disabled={busy} onClick={() => void begin()}>{busy ? <Loader2 className="animate-spin" /> : failed ? <RefreshCw /> : <KeyRound />}{busy ? '正在获取设备码…' : failed ? '重新获取设备码' : '获取设备码'}</Button></div>}
         {error && <p role="alert" className="mt-4 rounded-lg bg-bad-soft p-3 text-[13px] leading-5 text-bad-ink">{error}</p>}
         <div className="mt-6 flex items-start gap-2 border-t pt-4 text-xs leading-5 text-muted-foreground"><ShieldCheck size={13} className="mt-0.5 shrink-0" /><p>仅确认由你发起的授权，不要分享设备码。<br />若提示设备码登录未启用，请在 ChatGPT 安全设置或工作空间权限中开启。</p></div>
         {session && isPending(session) && <div className="mt-4 flex justify-center"><Button variant="ghost" size="sm" onClick={async () => { try { await cancelPending(); setError('') } catch { toast.error('取消失败，请重试') } }}><X />取消本次等待</Button></div>}
       </>}
-    </div> : <form className="space-y-5" onSubmit={submit}>
-      <label className="block"><span className="field-label">凭证来源</span><select className="select" value={source} onChange={e => setSource(e.target.value)}><option value="web">ChatGPT 网页登录</option><option value="codex">Codex 登录凭证</option></select></label>
-      <label className="block"><span className="field-label">账号凭证</span><Textarea className="font-mono text-xs" rows={7} value={items} onChange={e => setItems(e.target.value)} placeholder={'{\n  "access_token": "…",\n  "refresh_token": "…",\n  "email": "you@example.com"\n}'} required /><p className="field-help">支持 JSON 对象、JSON 数组、Codex auth.json，或每行一个 access_token。最多 200 个。</p></label>
+    </div> : <form className="mt-6 space-y-5" onSubmit={submit}>
+      <label className="block"><span className="field-label">凭证来源</span><select className="select" disabled={!!account} value={source} onChange={e => setSource(e.target.value)}><option value="web">ChatGPT 网页登录</option><option value="codex">Codex 登录凭证</option></select></label>
+      <label className="block"><span className="field-label">账号凭证</span><Textarea className="font-mono text-xs" rows={7} value={items} onChange={e => setItems(e.target.value)} placeholder={'{\n  "access_token": "…",\n  "refresh_token": "…",\n  "email": "you@example.com"\n}'} required /><p className="field-help">{account ? '仅导入当前账号的一份完整凭证，支持 JSON 对象或 Codex auth.json。' : '支持 JSON 对象、JSON 数组、Codex auth.json，或每行一个 access_token。最多 200 个。'}</p></label>
       <input ref={file} type="file" accept=".json,application/json" className="hidden" onChange={async e => { const selected = e.target.files?.[0]; if (selected) { if (selected.size > 1024 * 1024) return toast.error('文件不能超过 1 MB'); setItems(await selected.text()) } }} />
-      <div className="flex items-center justify-between"><Button type="button" size="sm" variant="outline" onClick={() => file.current?.click()}><FileJson />选择 JSON 文件</Button><Button disabled={busy || !items.trim()} type="submit">{busy ? <Loader2 className="animate-spin" /> : <Upload />}导入并验证</Button></div>
+      <div className="flex items-center justify-between"><Button type="button" size="sm" variant="outline" onClick={() => file.current?.click()}><FileJson />选择 JSON 文件</Button><Button disabled={busy || !items.trim()} type="submit">{busy ? <Loader2 className="animate-spin" /> : <Upload />}{account ? '更新并验证' : '导入并验证'}</Button></div>
       <p className="flex items-start gap-2 border-t pt-4 text-xs leading-5 text-muted-foreground"><ShieldCheck size={13} className="mt-0.5 shrink-0" />凭证加密保存，不会返回到页面。缺少 refresh_token 的账号无法自动续期。</p>
     </form>}
   </DialogContent></Dialog>

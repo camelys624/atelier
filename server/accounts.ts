@@ -23,13 +23,16 @@ export function normalizeAccount(raw: any, source: string, verified?: { sub: str
     token_endpoint: endpoint, ...(Number.isFinite(expires) && expires > 0 ? { expires_at: expires } : {}),
   } }
 }
-export function saveAccount(item: ReturnType<typeof normalizeAccount>) {
-  const existing = db.query<{ id: string; secret: string; inflight: number }, [string]>('SELECT id,secret,inflight FROM accounts WHERE identity=?').get(item.identity)
+export class AccountUpdateError extends Error {}
+export function saveAccount(item: ReturnType<typeof normalizeAccount>, targetAccountId?: string) {
+  const existing = targetAccountId ? getAccount(targetAccountId) : db.query<{ id: string; secret: string; inflight: number; identity: string }, [string]>('SELECT id,secret,inflight,identity FROM accounts WHERE identity=?').get(item.identity)
+  if (targetAccountId && !existing) throw new AccountUpdateError('原账号已被删除，请返回账号池重新选择')
+  if (targetAccountId && existing!.identity !== item.identity) throw new AccountUpdateError('授权账号与所选账号不一致，请使用原账号重新登录')
   if (existing) {
-    if (existing.inflight) throw new Error('这个账号正在生图，请完成后再更新凭证')
+    if (existing.inflight) throw new AccountUpdateError('这个账号正在生图，请完成后再更新凭证')
     const credentials = unseal(existing.secret)
     for (const [key, value] of Object.entries(item.secret)) if (value !== '' && value !== undefined) credentials[key] = value
-    db.run("UPDATE accounts SET secret=?,email=COALESCE(NULLIF(?,''),email),status=CASE WHEN status='disabled' THEN 'disabled' ELSE 'pending' END,last_error=NULL,last_refresh=NULL WHERE id=?", [seal(credentials), item.email, existing.id])
+    db.run("UPDATE accounts SET secret=?,email=COALESCE(NULLIF(?,''),email),status=CASE WHEN status='disabled' THEN 'disabled' ELSE 'pending' END,last_error=NULL,last_refresh=NULL,cooldown_until=0 WHERE id=?", [seal(credentials), item.email, existing.id])
     return { id: existing.id, added: false }
   }
   const accountId = id('acct')

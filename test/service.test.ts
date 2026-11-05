@@ -16,7 +16,7 @@ const scheduler = await import('../server/scheduler')
 const { validateImageUrl, fetchReference } = await import('../server/network')
 const { withImageTransfer } = await import('../server/image-transfers')
 const { DeviceAuthService, verifyDeviceIdentity } = await import('../server/device-auth')
-const { CODEX_CLIENT_ID, WEB_CLIENT_ID } = await import('../server/accounts')
+const { CODEX_CLIENT_ID, WEB_CLIENT_ID, normalizeAccount, saveAccount } = await import('../server/accounts')
 const { MAX_UPLOAD_BYTES, referencePath, uploadedReference, saveReferences, normalizeSize, normalizeQuality } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
 const { AdapterTimeoutError, bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
@@ -291,7 +291,68 @@ describe('image retention', () => {
     expect(existsSync(path)).toBe(true)
   })
 })
-describe('account validation network failures', () => {
+describe('account credential renewal and validation', () => {
+  test('a failed verification of old credentials cannot replace a newly reauthorized account status', async () => {
+    const jwt = (nonce: string) => `header.${Buffer.from(JSON.stringify({ sub: 'reauthorizing-user', exp: 9999999999, nonce })).toString('base64url')}.signature`
+    const original = saveAccount(normalizeAccount({ access_token: jwt('old'), refresh_token: 'old-refresh' }, 'codex'))
+    const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-reauthorization-race'), started = join(temporary, 'verification-started'), release = join(temporary, 'verification-release')
+    fakeAdapter(fake, `
+      if (p.account.access_token === ${JSON.stringify(jwt('old'))}) {
+        await Bun.write(${JSON.stringify(started)}, 'started'); while (!await Bun.file(${JSON.stringify(release)}).exists()) await Bun.sleep(5);
+        return { ok: false, error: 'token invalidated (/backend-api/me)', credentials: p.account };
+      }
+      return { ok: true, info: { type: 'Plus', quota: 10 }, credentials: p.account };
+    `)
+    process.env.PYTHON_BIN = fake
+    const pending = refreshAccount(original.id)
+    const settled = pending.catch(() => {})
+    try {
+      await waitFor(() => existsSync(started))
+      saveAccount(normalizeAccount({ access_token: jwt('new'), refresh_token: 'new-refresh' }, 'codex'), original.id)
+      await refreshAccount(original.id)
+      await Bun.write(release, 'release')
+      await pending
+      expect(store.getAccount(original.id)).toMatchObject({ status: 'ready', last_error: null })
+      expect(unseal(store.getAccount(original.id)!.secret).refresh_token).toBe('new-refresh')
+    } finally { await Bun.write(release, 'release'); await settled; stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+  })
+  test('concurrent requests renew once and persist rotated credentials before generation finishes', async () => {
+    account('concurrent-renewal', null, 3)
+    db.run('UPDATE accounts SET secret=? WHERE id=?', [seal({ access_token: 'expired-access', refresh_token: 'original-refresh', expires_at: 1 }), 'concurrent-renewal'])
+    const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-renewal-adapter'), calls = join(temporary, 'renewal-calls')
+    fakeAdapter(fake, `
+      const { appendFileSync } = await import('node:fs'); appendFileSync(${JSON.stringify(calls)}, JSON.stringify(p) + '\\n');
+      if (p.action === 'renew') { await Bun.sleep(50); return { ok: true, credentials: { access_token: 'renewed-access', refresh_token: 'rotated-refresh', expires_at: 9999999999 } } }
+      await Bun.sleep(200); return { ok: true, credentials: p.account };
+    `)
+    process.env.PYTHON_BIN = fake
+    try {
+      const stale = { access_token: 'expired-access', refresh_token: 'original-refresh', expires_at: 1 }
+      const pending = Promise.all(Array.from({ length: 3 }, () => bridge({ action: 'generate', accountId: 'concurrent-renewal', account: stale })))
+      await waitFor(() => unseal(store.getAccount('concurrent-renewal')!.secret).refresh_token === 'rotated-refresh')
+      const results = await pending
+      const payloads = (await Bun.file(calls).text()).trim().split('\n').map(line => JSON.parse(line))
+      expect(payloads.filter(p => p.action === 'renew')).toHaveLength(1)
+      expect(results.every(r => r.credentials.access_token === 'renewed-access')).toBe(true)
+      expect(unseal(store.getAccount('concurrent-renewal')!.secret).refresh_token).toBe('rotated-refresh')
+    } finally { stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+  })
+  test('a slow response cannot overwrite credentials saved by a later renewal', async () => {
+    account('stale-credentials')
+    const original = { access_token: 'old-access', refresh_token: 'old-refresh', expires_at: 9999999999 }
+    db.run('UPDATE accounts SET secret=? WHERE id=?', [seal(original), 'stale-credentials'])
+    const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-stale-credentials-adapter'), started = join(temporary, 'stale-started'), release = join(temporary, 'stale-release')
+    fakeAdapter(fake, `await Bun.write(${JSON.stringify(started)}, 'started'); while (!await Bun.file(${JSON.stringify(release)}).exists()) await Bun.sleep(5); return { ok: true, credentials: p.account }`)
+    process.env.PYTHON_BIN = fake
+    const pending = bridge({ action: 'generate', accountId: 'stale-credentials', account: original })
+    try {
+      await waitFor(() => existsSync(started))
+      db.run('UPDATE accounts SET secret=? WHERE id=?', [seal({ access_token: 'new-access', refresh_token: 'new-refresh', expires_at: 9999999999 }), 'stale-credentials'])
+      await Bun.write(release, 'release')
+      await pending
+      expect(unseal(store.getAccount('stale-credentials')!.secret).refresh_token).toBe('new-refresh')
+    } finally { await Bun.write(release, 'release'); await pending.catch(() => {}); stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+  })
   test('preserves rotated tokens, schedules a short network retry, then recovers without reimporting', async () => {
     account('transient-network')
     const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-validation-adapter')
@@ -386,6 +447,98 @@ describe('device authorization', () => {
     })
     return { service, calls, advance: (ms: number) => { now += ms }, checked: () => checked }
   }
+  function existingAccount(sub = 'verified-account-id') {
+    const saved = saveAccount(normalizeAccount({ access_token: 'old-access-token-to-be-replaced', refresh_token: 'old-refresh-token', name: '保留账号名称' }, 'codex', { sub, email: 'oauth@example.com', accountId: 'workspace-a' }))
+    db.run("UPDATE accounts SET status='error',slots=7,success=12,fail=3,last_error='token invalidated',cooldown_until=? WHERE id=?", [Date.now() + 600_000, saved.id])
+    return store.getAccount(saved.id)!
+  }
+  test('reauthorizes the selected account in place and preserves settings, history and creation time', async () => {
+    const original = existingAccount(), f = fixture([Response.json(grant), Response.json(tokens)])
+    const started = await f.service.begin('browser-a', original.id)
+    expect(started.targetAccountId).toBe(original.id)
+    expect(store.getAccount(original.id)!.secret).toBe(original.secret)
+    f.advance(5000); await f.service.tick()
+    const result = f.service.get(started.id, 'browser-a')!
+    expect(result.status).toBe('success')
+    expect(result.accountId).toBe(original.id)
+    expect(store.accounts()).toHaveLength(1)
+    const updated = store.getAccount(original.id)!
+    expect(updated).toMatchObject({ name: original.name, slots: 7, success: 12, fail: 3, created: original.created, status: 'pending', last_error: null, cooldown_until: 0 })
+    expect(unseal(updated.secret).refresh_token).toBe(tokens.refresh_token)
+    expect(f.checked()).toBe(1)
+  })
+  test('refuses a different login without modifying the selected account or creating another account', async () => {
+    const original = existingAccount('another-user'), f = fixture([Response.json(grant), Response.json(tokens)])
+    const started = await f.service.begin('browser-a', original.id)
+    f.advance(5000); await f.service.tick()
+    expect(f.service.get(started.id, 'browser-a')).toMatchObject({ status: 'failed', error: expect.stringContaining('不一致') })
+    expect(store.getAccount(original.id)).toEqual(original)
+    expect(store.accounts()).toHaveLength(1)
+    expect(f.checked()).toBe(0)
+  })
+  test('cancelled or declined reauthorization leaves original credentials intact', async () => {
+    const original = existingAccount(), f = fixture([Response.json({ error: 'access_denied' }, { status: 403 })])
+    const declined = await f.service.begin('browser-a', original.id)
+    f.advance(5000); await f.service.tick()
+    expect(f.service.get(declined.id, 'browser-a')!.status).toBe('failed')
+    expect(store.getAccount(original.id)).toEqual(original)
+    const cancelled = await f.service.begin('browser-a', original.id)
+    f.service.cancel(cancelled.id, 'browser-a')
+    expect(store.getAccount(original.id)).toEqual(original)
+  })
+  test('does not recreate an account deleted while reauthorization was pending', async () => {
+    const original = existingAccount(), f = fixture([Response.json(grant), Response.json(tokens)])
+    const started = await f.service.begin('browser-a', original.id)
+    db.run('DELETE FROM accounts WHERE id=?', [original.id])
+    f.advance(5000); await f.service.tick()
+    expect(f.service.get(started.id, 'browser-a')).toMatchObject({ status: 'failed', error: expect.stringContaining('已被删除') })
+    expect(store.accounts()).toHaveLength(0)
+  })
+  test('keeps disabled accounts disabled and refuses credential changes if generation starts during authorization', async () => {
+    const original = existingAccount(), f = fixture([Response.json(grant), Response.json(tokens), Response.json(grant), Response.json(tokens)])
+    db.run("UPDATE accounts SET status='disabled' WHERE id=?", [original.id])
+    const disabled = await f.service.begin('browser-a', original.id)
+    f.advance(5000); await f.service.tick()
+    expect(f.service.get(disabled.id, 'browser-a')!.status).toBe('success')
+    expect(store.getAccount(original.id)!.status).toBe('disabled')
+    const started = await f.service.begin('browser-a', original.id)
+    const before = store.getAccount(original.id)!.secret
+    db.run('UPDATE accounts SET inflight=1 WHERE id=?', [original.id])
+    f.advance(5000); await f.service.tick()
+    expect(f.service.get(started.id, 'browser-a')).toMatchObject({ status: 'failed', error: expect.stringContaining('正在生图') })
+    expect(store.getAccount(original.id)!.secret).toBe(before)
+  })
+  test('validates reauthorization targets before requesting a device code and never reuses another target session', async () => {
+    const original = existingAccount(), f = fixture()
+    await expect(f.service.begin('browser-a', 'missing-account')).rejects.toThrow('不存在')
+    db.run('UPDATE accounts SET inflight=1 WHERE id=?', [original.id])
+    await expect(f.service.begin('browser-a', original.id)).rejects.toThrow('正在生图')
+    expect(f.calls).toHaveLength(0)
+    db.run('UPDATE accounts SET inflight=0 WHERE id=?', [original.id])
+    const [started, other] = await Promise.allSettled([f.service.begin('browser-a', original.id), f.service.begin('browser-a')])
+    expect(started.status).toBe('fulfilled')
+    expect(other.status).toBe('rejected')
+    await expect(f.service.begin('browser-a')).rejects.toThrow('先完成或取消')
+    expect(f.calls).toHaveLength(1)
+    expect((await request('/api/accounts/authorize', { accountId: 'missing-account' })).status).toBe(404)
+    expect((await request('/api/accounts/authorize', { accountId: original.id }, {})).status).toBe(401)
+  })
+  test('manually updates only the selected account and rejects different identities or batches atomically', async () => {
+    const jwt = (sub: string, nonce: string) => `header.${Buffer.from(JSON.stringify({ sub, exp: 9999999999, nonce })).toString('base64url')}.signature`
+    const original = saveAccount(normalizeAccount({ access_token: jwt('manual-user', 'old'), refresh_token: 'old-refresh' }, 'web'))
+    db.run("UPDATE accounts SET status='disabled',slots=8,success=9,cooldown_until=9999999999999 WHERE id=?", [original.id])
+    const result = await request('/api/accounts', { source: 'web', accountId: original.id, items: { access_token: jwt('manual-user', 'new'), refresh_token: 'new-refresh' } })
+    expect(await result.json()).toEqual({ added: 0, updated: 1 })
+    const updated = store.getAccount(original.id)!
+    expect(updated).toMatchObject({ status: 'disabled', slots: 8, success: 9, cooldown_until: 0 })
+    expect(unseal(updated.secret).refresh_token).toBe('new-refresh')
+    const mismatched = await request('/api/accounts', { source: 'web', accountId: original.id, items: { access_token: jwt('another-user', 'new') } })
+    expect(mismatched.status).toBe(400)
+    expect((await mismatched.json()).error.message).toContain('不一致')
+    expect((await request('/api/accounts', { accountId: original.id, items: [{ access_token: jwt('manual-user', 'a') }, { access_token: jwt('manual-user', 'b') }] })).status).toBe(400)
+    expect(store.accounts()).toHaveLength(1)
+    expect(store.getAccount(original.id)).toEqual(updated)
+  })
   test('exposes only the official page and user code; binds sessions to their initiator', async () => {
     const f = fixture(), value = await f.service.begin('browser-a')
     expect(value.verificationUrl).toBe('https://auth.openai.com/codex/device')

@@ -5,6 +5,7 @@ import { modelConfiguration } from './image-models'
 
 const children = new Set<ReturnType<typeof Bun.spawn>>()
 class AdapterError extends Error { constructor(message: string, public kind: string) { super(message) } }
+class AccountCredentialsChangedError extends Error {}
 const NO_RESULT = '上游适配器未返回结果，请检查 Python 依赖或任务超时设置'
 const EXITED = '上游适配器进程已退出，请检查 Python 依赖后重试'
 // Extra wait beyond the job timeout before giving up on a request; ADAPTER_TIMEOUT_GRACE_MS only shortens it in tests.
@@ -34,7 +35,7 @@ export function adapterStats() {
 function retire(worker: Worker) { if (worker.draining && [...worker.pending.values()].every(request => request.abandoned)) worker.child.kill('SIGTERM') }
 function settleLate(request: Pending, message: any) {
   // The caller already gave up on this result, but a rotated token must still be kept.
-  if (typeof request.payload.accountId === 'string') updateCredentials(request.payload.accountId, message.credentials)
+  if (typeof request.payload.accountId === 'string') updateCredentials(request.payload.accountId, message.credentials, request.payload.account)
   request.abandoned!()
 }
 function startWorker() {
@@ -102,9 +103,15 @@ async function spawned(payload: Record<string, unknown>, timeoutSeconds: number)
 }
 
 export async function bridge(payload: Record<string, unknown>, timeoutSeconds = settings().jobTimeoutSeconds): Promise<any> {
+  if (typeof payload.accountId === 'string' && payload.account && payload.action !== 'renew') {
+    payload = { ...payload, account: await preparedCredentials(payload.accountId) }
+  }
   const result = process.env.ADAPTER_POOL === '0' ? await spawned(payload, timeoutSeconds) : await pooled(payload, timeoutSeconds)
+  if (typeof payload.accountId === 'string') {
+    const accepted = updateCredentials(payload.accountId, result.credentials, payload.account)
+    if (payload.action === 'refresh' && accepted === false) throw new AccountCredentialsChangedError()
+  }
   if (!result.ok) {
-    if (typeof payload.accountId === 'string') updateCredentials(payload.accountId, result.credentials)
     throw new AdapterError(result.error || '上游请求失败', result.error_kind || 'upstream')
   }
   return result
@@ -112,33 +119,65 @@ export async function bridge(payload: Record<string, unknown>, timeoutSeconds = 
 export function credentials(account: Account) {
   return { ...unseal(account.secret), source_type: account.source, type: account.plan, email: account.email }
 }
-export function updateCredentials(accountId: string, values: any) {
+export function updateCredentials(accountId: string, values: any, expected?: any) {
   const current = getAccount(accountId)
-  if (!current || !values) return
-  db.run('UPDATE accounts SET secret=? WHERE id=?', [seal({ ...unseal<Record<string, unknown>>(current.secret), ...values }), accountId])
+  if (!current) return false
+  if (!values) return
+  const saved = unseal<Record<string, unknown>>(current.secret)
+  // A slow request may return the credentials it started with after a newer
+  // request (or a reauthorization) has already saved a rotated token.
+  if (expected && (saved.access_token !== expected.access_token || saved.refresh_token !== expected.refresh_token)) return false
+  db.run('UPDATE accounts SET secret=? WHERE id=?', [seal({ ...saved, ...values }), accountId])
+  return true
+}
+const renewing = new Map<string, Promise<unknown>>()
+async function preparedCredentials(accountId: string) {
+  const pending = renewing.get(accountId)
+  if (pending) await pending
+  const account = getAccount(accountId)
+  if (!account) throw new Error('账号不存在')
+  const values = credentials(account)
+  let expiry = Number(values.expires_at || 0)
+  if (!expiry) {
+    try { expiry = Number(JSON.parse(Buffer.from(values.access_token.split('.')[1], 'base64url').toString()).exp || 0) } catch {}
+  }
+  if (values.refresh_token && expiry < Date.now() / 1000 + 300) {
+    let renewal = renewing.get(accountId)
+    if (!renewal) {
+      renewal = bridge({ action: 'renew', accountId, account: values }, 45)
+      renewing.set(accountId, renewal)
+    }
+    try { await renewal } finally { if (renewing.get(accountId) === renewal) renewing.delete(accountId) }
+  }
+  const latest = getAccount(accountId)
+  if (!latest) throw new Error('账号不存在')
+  return credentials(latest)
 }
 const refreshing = new Set<string>()
-export async function refreshAccount(accountId: string) {
+export async function refreshAccount(accountId: string): Promise<void> {
   if (refreshing.has(accountId)) return
   const account = getAccount(accountId)
   if (!account || account.inflight > 0 || account.status === 'disabled') return
   refreshing.add(accountId)
+  let credentialsChanged = false
   db.run("UPDATE accounts SET status='refreshing' WHERE id=? AND status!='disabled'", [accountId])
   try {
     const result = await bridge({ action: 'refresh', accountId, account: credentials(account) }, 90)
-    updateCredentials(accountId, result.credentials)
     const info = result.info
     // The reference adapter reports web image quota. Do not pretend it is Codex's quota.
     const quota = account.source === 'codex' ? null : Number(info.quota || 0)
     db.run("UPDATE accounts SET email=?,plan=?,quota=?,status=CASE WHEN status='disabled' THEN 'disabled' ELSE ? END,last_refresh=?,last_error=NULL,cooldown_until=0 WHERE id=?", [info.email || account.email, info.type || 'unknown', quota, quota === 0 ? 'limited' : 'ready', Date.now(), accountId])
   } catch (error) {
+    // Reauthorization may finish while an old read-only check is still running.
+    // Preserve the new account state and verify its new credentials once it ends.
+    if (error instanceof AccountCredentialsChangedError) { credentialsChanged = true; return }
     const network = error instanceof AdapterError && error.kind === 'network'
     const message = network ? `账号验证时网络连接失败，约30秒后自动重试：${safeError(error)}` : safeError(error)
     db.run("UPDATE accounts SET status=CASE WHEN status='disabled' THEN 'disabled' ELSE 'error' END,last_error=?,last_refresh=?,cooldown_until=? WHERE id=?", [message, Date.now(), network ? Date.now() + 30_000 : 0, accountId])
     console.warn(JSON.stringify({ event: 'account_verification_failed', time: new Date().toISOString(), accountId, kind: network ? 'network' : 'upstream', message }))
     if (network) throw new Error(message)
     throw error
-  } finally { refreshing.delete(accountId) }
+  } finally { refreshing.delete(accountId); if (credentialsChanged) await refreshAccount(accountId) }
 }
 export function safeError(error: unknown) {
   return String(error instanceof Error ? error.message : error).replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/eyJ[A-Za-z0-9_.-]{30,}/g, '[redacted]').replace(/https?:\/\/[^\s]+/g, '[upstream]').slice(0, 350)
@@ -149,7 +188,6 @@ export async function generateImage(account: Account, request: { prompt: string;
   const discard = () => Promise.all([output, output.replace(/\.png$/, '.part')].map(path => unlink(path).catch(() => {})))
   try {
     const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, responses_model: modelConfiguration().responsesModel, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
-    updateCredentials(account.id, result.credentials)
     return { path: output, mime: result.mime || 'image/png', bytes: result.bytes }
   } catch (error) {
     void (error instanceof AdapterTimeoutError ? error.settled.then(discard) : discard())

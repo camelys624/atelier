@@ -119,7 +119,11 @@ export async function handleApi(request: Request): Promise<Response> {
     if (path === '/api/auth/session') return json({ admin: who.admin })
     if (path.startsWith('/api/') && !who.admin) throw new HttpError(403, '需要管理员权限')
     const authorizationOwner = hash(who.cookie || request.headers.get('authorization') || who.owner)
-    if (path === '/api/accounts/authorize' && request.method === 'POST') return json(await deviceAuth.begin(authorizationOwner), 201)
+    if (path === '/api/accounts/authorize' && request.method === 'POST') {
+      const input = await body(request)
+      if (input.accountId !== undefined && (typeof input.accountId !== 'string' || !input.accountId)) return bad('请选择有效的账号')
+      return json(await deviceAuth.begin(authorizationOwner, input.accountId), 201)
+    }
     const authorizationMatch = path.match(/^\/api\/accounts\/authorize\/([^/]+)$/)
     if (authorizationMatch) {
       const authorization = deviceAuth.get(authorizationMatch[1], authorizationOwner)
@@ -164,11 +168,13 @@ export async function handleApi(request: Request): Promise<Response> {
       }
       if (!Array.isArray(items)) items = [items]
       if (!items.length || items.length > 200) return bad('一次可导入 1～200 个账号')
+      if (input.accountId !== undefined && (typeof input.accountId !== 'string' || !input.accountId || items.length !== 1)) return bad('更新凭证时请选择一个账号，并导入一份凭证')
       const prepared = items.map((item: any) => normalizeAccount(item, source))
       let added = 0
       db.transaction(() => {
-        for (const item of prepared) if (saveAccount(item).added) added++
+        for (const item of prepared) if (saveAccount(item, input.accountId).added) added++
       }).immediate()
+      if (input.accountId) void refreshAccount(input.accountId).catch(() => {})
       return json({ added, updated: prepared.length - added })
     }
     const accountMatch = path.match(/^\/api\/accounts\/([^/]+)(?:\/(refresh))?$/)

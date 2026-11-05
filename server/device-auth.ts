@@ -1,6 +1,6 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey, type JWTPayload } from 'jose'
 import { db, getAccount, id, seal, unseal } from './store'
-import { CODEX_CLIENT_ID, normalizeAccount, saveAccount } from './accounts'
+import { AccountUpdateError, CODEX_CLIENT_ID, normalizeAccount, saveAccount } from './accounts'
 import { refreshAccount } from './adapter'
 
 const ISSUER = 'https://auth.openai.com'
@@ -10,8 +10,8 @@ const jwks = createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks.json`), { ti
 const activeStates = ['pending', 'exchanging']
 type AuthState = 'pending' | 'exchanging' | 'success' | 'failed' | 'expired' | 'cancelled'
 type AuthRow = { id: string; owner: string; status: AuthState; created: number; expires: number; next_poll: number; interval: number; secret: string; error: string | null; account_id: string | null }
-type AuthSecret = { deviceId: string; userCode: string; clientId: string }
-export type DeviceAuthorization = { id: string; status: AuthState; verificationUrl: string; userCode: string; expires: number; pollInterval: number; error: string | null; accountId: string | null; accountStatus: string | null; accountName: string | null }
+type AuthSecret = { deviceId: string; userCode: string; clientId: string; targetAccountId?: string }
+export type DeviceAuthorization = { id: string; status: AuthState; verificationUrl: string; userCode: string; expires: number; pollInterval: number; error: string | null; accountId: string | null; accountStatus: string | null; accountName: string | null; targetAccountId: string | null }
 type VerifiedIdentity = { sub: string; email?: string; accountId?: string }
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>
 
@@ -53,19 +53,33 @@ export class DeviceAuthService {
     if (!row) return null
     const secret = activeStates.includes(row.status) ? unseal<AuthSecret>(row.secret) : null
     const account = row.account_id ? getAccount(row.account_id) : null
-    return { id: row.id, status: row.status, verificationUrl: VERIFICATION_URL, userCode: secret?.userCode || '', expires: row.expires, pollInterval: Math.max(3, row.interval), error: row.error, accountId: row.account_id, accountStatus: account?.status || null, accountName: account?.email || account?.name || null }
+    return { id: row.id, status: row.status, verificationUrl: VERIFICATION_URL, userCode: secret?.userCode || '', expires: row.expires, pollInterval: Math.max(3, row.interval), error: row.error, accountId: row.account_id, accountStatus: account?.status || null, accountName: account?.email || account?.name || null, targetAccountId: secret?.targetAccountId || null }
   }
-  begin(owner: string) {
+  async begin(owner: string, targetAccountId?: string) {
     const pending = this.starting.get(owner)
-    if (pending) return pending
-    const task = this.create(owner).finally(() => this.starting.delete(owner))
+    if (pending) {
+      const existing = await pending
+      if ((existing.targetAccountId || undefined) !== targetAccountId) throw new DeviceAuthError(409, '请先完成或取消当前授权，再为另一个账号授权')
+      return existing
+    }
+    const task = this.create(owner, targetAccountId).finally(() => this.starting.delete(owner))
     this.starting.set(owner, task)
     return task
   }
-  private async create(owner: string): Promise<DeviceAuthorization> {
+  private async create(owner: string, targetAccountId?: string): Promise<DeviceAuthorization> {
     this.expire()
+    if (targetAccountId) {
+      const target = getAccount(targetAccountId)
+      if (!target) throw new DeviceAuthError(404, '账号不存在')
+      if (target.source !== 'codex') throw new DeviceAuthError(400, '网页账号请通过手动导入更新凭证')
+      if (target.inflight) throw new DeviceAuthError(409, '这个账号正在生图，请完成后再重新授权')
+    }
     const existing = db.query<AuthRow, [string]>("SELECT * FROM device_authorizations WHERE owner=? AND status IN ('pending','exchanging') ORDER BY created DESC LIMIT 1").get(owner)
-    if (existing) return this.get(existing.id, owner)!
+    if (existing) {
+      const current = this.get(existing.id, owner)!
+      if ((current.targetAccountId || undefined) !== targetAccountId) throw new DeviceAuthError(409, '请先完成或取消当前授权，再为另一个账号授权')
+      return current
+    }
     const recent = db.query<{ n: number }, [string, number]>('SELECT COUNT(*) AS n FROM device_authorizations WHERE owner=? AND created>?').get(owner, this.now() - 60_000)!.n
     if (recent >= 3) throw new DeviceAuthError(429, '设备码生成过于频繁，请一分钟后重试')
     const count = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM device_authorizations WHERE status IN ('pending','exchanging')").get()!.n
@@ -86,7 +100,7 @@ export class DeviceAuthService {
     const interval = Math.min(60, Math.max(3, Number(value.interval) || 5))
     const ttl = Math.min(900, Math.max(30, Number(value.expires_in) || 900)) * 1000
     const now = this.now(), authId = id('auth')
-    db.run('INSERT INTO device_authorizations(id,owner,status,created,expires,next_poll,interval,secret) VALUES(?,?,?,?,?,?,?,?)', [authId, owner, 'pending', now, now + ttl, now + interval * 1000, interval, seal({ deviceId, userCode, clientId })])
+    db.run('INSERT INTO device_authorizations(id,owner,status,created,expires,next_poll,interval,secret) VALUES(?,?,?,?,?,?,?,?)', [authId, owner, 'pending', now, now + ttl, now + interval * 1000, interval, seal({ deviceId, userCode, clientId, targetAccountId })])
     return this.get(authId, owner)!
   }
   cancel(authId: string, owner: string) {
@@ -145,13 +159,13 @@ export class DeviceAuthService {
       const expiresAt = Number(tokens.expires_in) > 0 ? timestamp + Number(tokens.expires_in) : accessExpiry > timestamp ? accessExpiry : timestamp + 3600
       const result = db.transaction(() => {
         if (!this.alive(row.id)) return null
-        const saved = saveAccount(normalizeAccount({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token, client_id: secret.clientId, token_endpoint: TOKEN_ENDPOINT, expires_at: expiresAt, source_type: 'codex' }, 'codex', verified))
+        const saved = saveAccount(normalizeAccount({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, id_token: tokens.id_token, client_id: secret.clientId, token_endpoint: TOKEN_ENDPOINT, expires_at: expiresAt, source_type: 'codex' }, 'codex', verified), secret.targetAccountId)
         db.run("UPDATE device_authorizations SET status='success',secret=?,account_id=?,error=NULL WHERE id=?", [seal({}), saved.id, row.id])
         return saved
       }).immediate()
       if (result) void this.checkAccount(result.id).catch(() => {})
     } catch (error) {
-      if (this.alive(row.id)) this.finish(row.id, 'failed', error instanceof Error && error.message.includes('正在生图') ? '这个账号正在生图，请在任务完成后重新授权更新凭证' : '授权结果未通过验证或兑换结果未知，请重新开始授权')
+      if (this.alive(row.id)) this.finish(row.id, 'failed', error instanceof AccountUpdateError ? error.message : '授权结果未通过验证或兑换结果未知，请重新开始授权')
     } finally { this.active.delete(row.id) }
   }
   start() {

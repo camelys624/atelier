@@ -98,12 +98,12 @@ module('services.config', config=config)
 module('services.account_service', account_service=AccountContext())
 module('services.image_storage_service', image_storage_service=None)
 
-def refreshed_account(values=None):
+def refreshed_account(values=None, force=False):
     from curl_cffi import requests
     values = account if values is None else values
     info = AccountContext._decode_jwt_payload(values.get('access_token', ''))
     expires_at = int(values.get('expires_at') or info.get('exp') or 0)
-    if values.get('refresh_token') and expires_at < time.time() + 300:
+    if values.get('refresh_token') and (force or expires_at < time.time() + 300):
         kwargs = {'proxy': values['proxy']} if values.get('proxy') else {}
         token_endpoint = values.get('token_endpoint') or 'https://auth.openai.com/oauth/token'
         if token_endpoint not in ('https://auth.openai.com/oauth/token', 'https://auth.openai.com/api/accounts/oauth/token'):
@@ -121,6 +121,8 @@ def refreshed_account(values=None):
             if result.get(key): values[key] = result[key]
         if result.get('expires_in'):
             values['expires_at'] = int(time.time()) + int(result['expires_in'])
+        else:
+            values['expires_at'] = int(AccountContext._decode_jwt_payload(values['access_token']).get('exp') or 0)
     return values
 
 # Keep the bytes in this process and write one result to the spool; no base64 IPC output.
@@ -137,21 +139,38 @@ def execute(request=None):
         return {'ok': True, 'protocol': 'chatgpt2api', 'commit': '92dd80e'}
     _local.account = values
     _local.timeout = int(request['timeout']) if request.get('timeout') else None
-    refreshed_account(values)
+    # The application serializes renewal per account and saves rotated credentials
+    # before dispatching generation to any of its worker processes.
+    if request.get('action') == 'renew':
+        refreshed_account(values)
+        return {'credentials': credential_values(values)}
+    if not request.get('accountId'):
+        refreshed_account(values)
     current = register_account(values)
     if not WORKER: token = current
-    from services.openai_backend_api import OpenAIBackendAPI
+    from services.openai_backend_api import OpenAIBackendAPI, InvalidAccessTokenError
     backend = OpenAIBackendAPI(current)
     backend.codex_responses_model = request.get('responses_model')
     try:
         if request.get('action') == 'refresh':
             # Only read-only account checks are retried. Never replay image generation.
-            for attempt in range(3):
+            renewed = False
+            for attempt in range(4):
                 try:
                     info = backend.get_user_info()
                     break
+                except InvalidAccessTokenError:
+                    if renewed or not values.get('refresh_token') or attempt == 3:
+                        raise
+                    renewed = True
+                    backend.close()
+                    release_account(current)
+                    current = None
+                    refreshed_account(values, force=True)
+                    current = register_account(values)
+                    backend = OpenAIBackendAPI(current)
                 except RequestException as error:
-                    if not is_network_error(error) or attempt == 2:
+                    if not is_network_error(error) or attempt >= 2:
                         raise
                     backend.close()
                     time.sleep(0.3 * (attempt + 1))
@@ -181,7 +200,7 @@ def execute(request=None):
         raise RuntimeError('上游未返回图片结果')
     finally:
         backend.close()
-        release_account(current)
+        if current is not None: release_account(current)
         _local.account = _local.timeout = None
 
 def handle(request):
