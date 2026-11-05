@@ -3,7 +3,7 @@ import { HttpError } from './http'
 
 export const IMAGE_QUALITIES = ['auto', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 type Quality = typeof IMAGE_QUALITIES[number]
-export type ImageModel = { id: string; name: string; source: 'web' | 'codex'; description: string; sizes: readonly string[]; qualities: readonly Quality[]; enabled: boolean }
+export type ImageModel = { id: string; name: string; source: 'web' | 'codex' | 'openai'; upstreamModel?: string; description: string; sizes: readonly string[]; qualities: readonly Quality[]; enabled: boolean }
 
 const standardSizes = ['1024x1024', '1536x1024', '1024x1536', 'auto']
 const standardQualities: Quality[] = ['auto', 'low', 'medium', 'high']
@@ -16,20 +16,30 @@ const defaults: ImageModel[] = ([
 ] satisfies Omit<ImageModel, 'enabled'>[]).map(model => ({ ...model, enabled: true }))
 const invalid = (message: string): never => { throw new HttpError(400, message) }
 
+function openAIPixelSize(value: string) {
+  const match = value.match(/^(\d+)\s*[x×*]\s*(\d+)$/)
+  if (!match) return invalid('OpenAI API 的 size 请使用 auto 或像素尺寸，例如 3840x2160；4K 竖图可使用 2160x3840')
+  const width = Number(match[1]), height = Number(match[2]), pixels = width * height
+  if (width <= 0 || height <= 0 || width % 16 || height % 16 || width > 3840 || height > 3840 || width / height < 1 / 3 || width / height > 3 || pixels < 655_360 || pixels > 8_294_400) return invalid('OpenAI API 尺寸要求：宽高为 16 的倍数，每边不超过 3840，比例介于 1:3～3:1，总像素为 655360～8294400；4K 请使用 3840x2160 或 2160x3840，不支持 4096x4096')
+  return `${width}x${height}`
+}
+
 /** Validate once before committing an administrator's changes. */
 function parseModel(input: unknown): ImageModel {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return invalid('模型配置需要是对象')
   const row = input as Record<string, unknown>
-  for (const key of Object.keys(row)) if (!['id', 'name', 'source', 'description', 'sizes', 'qualities', 'enabled'].includes(key)) return invalid(`模型配置有未知字段 ${key}`)
+  for (const key of Object.keys(row)) if (!['id', 'name', 'source', 'upstreamModel', 'description', 'sizes', 'qualities', 'enabled'].includes(key)) return invalid(`模型配置有未知字段 ${key}`)
   if (typeof row.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(row.id)) return invalid('模型 ID 需要 1～128 个字母、数字、点、下划线或连字符，并以字母或数字开头')
   const id = row.id
   const known = defaults.find(model => model.id === id)
   const source = row.source === undefined ? known?.source : row.source
-  if (source !== 'web' && source !== 'codex') return invalid(`${id} 的 source 必须为 web 或 codex`)
+  if (source !== 'web' && source !== 'codex' && source !== 'openai') return invalid(`${id} 的 source 必须为 web、codex 或 openai`)
   // The retained web protocol only recognizes this ID. Keep historical tasks on their original source.
-  if ((source === 'web') !== (id === 'gpt-image-2')) return invalid('网页来源仅支持 gpt-image-2；其他模型请使用 codex 来源')
+  if ((source === 'web') !== (id === 'gpt-image-2')) return invalid('网页来源仅支持 gpt-image-2；其他模型请使用 codex 或 openai 来源')
+  if (source === 'openai' && (typeof row.upstreamModel !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(row.upstreamModel))) return invalid('请填写有效的 OpenAI 上游模型 ID，最多 128 个字符')
+  if (source !== 'openai' && row.upstreamModel !== undefined) return invalid('上游模型映射仅适用于 OpenAI API 来源')
   const name = row.name === undefined ? known?.name ?? id : row.name
-  const description = row.description === undefined ? known?.description ?? `使用 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号生成` : row.description
+  const description = row.description === undefined ? known?.description ?? (source === 'openai' ? '使用 OpenAI API 生成' : `使用 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号生成`) : row.description
   if (typeof name !== 'string' || !name.trim() || name.length > 100 || typeof description !== 'string' || description.length > 500) return invalid('模型名称不能为空且最多 100 字，说明最多 500 字')
   const sizes = row.sizes === undefined ? known?.sizes ?? standardSizes : row.sizes
   if (!Array.isArray(sizes) || !sizes.length || sizes.length > 32 || sizes.some(size => {
@@ -38,10 +48,11 @@ function parseModel(input: unknown): ImageModel {
     const [width, height] = size.split('x').map(Number)
     return !width || !height || width % 16 !== 0 || height % 16 !== 0 || width / height < 1 / 3 || width / height > 3
   }) || !sizes.some(size => size !== 'auto') || new Set(sizes).size !== sizes.length) return invalid(`${id} 的 sizes 需要不重复的尺寸数组，至少一个明确尺寸，宽高为 16 的倍数且比例介于 1:3～3:1；可包含 auto`)
+  if (source === 'openai') for (const size of sizes) if (size !== 'auto') openAIPixelSize(size)
   const qualities = row.qualities === undefined ? known?.qualities ?? standardQualities : row.qualities
   if (!Array.isArray(qualities) || !qualities.length || qualities.some(quality => !IMAGE_QUALITIES.includes(quality)) || new Set(qualities).size !== qualities.length) return invalid(`${id} 的 qualities 需要不重复的质量档位数组：${IMAGE_QUALITIES.join('、')}`)
   if (row.enabled !== undefined && typeof row.enabled !== 'boolean') return invalid('启用状态必须是布尔值')
-  return { id, name: name.trim(), source, description: description.trim(), sizes, qualities, enabled: row.enabled ?? true }
+  return { id, name: name.trim(), source, ...(source === 'openai' ? { upstreamModel: row.upstreamModel as string } : {}), description: description.trim(), sizes, qualities, enabled: row.enabled ?? true }
 }
 
 export function modelConfiguration(): { models: ImageModel[]; defaultModel: string; responsesModel: string } {
@@ -71,6 +82,7 @@ export function saveImageModel(input: unknown, existingId?: string) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) return invalid('模型配置需要是对象')
     if (existingId && 'id' in input && input.id !== existingId) return invalid('模型 ID 不可修改，请添加新模型')
     const value = parseModel({ ...previous, ...input })
+    if (previous && previous.source !== value.source) return invalid('模型来源不可修改，请添加新模型')
     if (!previous && config.models.some(model => model.id === value.id)) throw new HttpError(409, '模型 ID 已存在')
     if (!previous && config.models.length >= 100) return invalid('最多可配置 100 个模型')
     if (value.id === config.defaultModel && !value.enabled) throw new HttpError(409, '请先将其他启用的模型设为默认，再停用此模型')
@@ -103,12 +115,30 @@ const parseRatio = (value: unknown) => {
   const ratio = match ? Number(match[1]) / Number(match[2]) : NaN
   return Number.isFinite(ratio) && ratio > 0 ? ratio : undefined
 }
-export function normalizeSize(size: unknown, aspectRatio?: unknown, model = defaultImageModel()) {
+const parseDimensions = (value: unknown) => {
+  const match = String(value ?? '').trim().match(/^(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+(?:\.\d+)?)$/i)
+  if (!match) return undefined
+  const width = Number(match[1]), height = Number(match[2])
+  return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0 ? { width, height } : undefined
+}
+export function normalizeSize(size: unknown, model = defaultImageModel()) {
   const sizes = modelConfiguration().models.find(item => item.id === model)?.sizes ?? standardSizes
   const text = String(size ?? '').trim().toLowerCase()
   if (sizes.includes(text)) return text
   const explicit = sizes.filter(value => value !== 'auto')
-  const ratio = parseRatio(size) ?? parseRatio(aspectRatio)
+  const dimensions = parseDimensions(size)
+  if (dimensions) {
+    // Match both shape and scale. Comparing ratio alone makes same-ratio 4K
+    // requests pick the first (often 1K) preset regardless of their pixel size.
+    const distance = (value: string) => {
+      const candidate = parseDimensions(value)!
+      const width = Math.log(candidate.width / dimensions.width), height = Math.log(candidate.height / dimensions.height)
+      const shape = width - height, scale = (width + height) / 2
+      return 4 * shape * shape + scale * scale
+    }
+    return explicit.reduce((best, value) => distance(value) < distance(best) - 1e-12 ? value : best)
+  }
+  const ratio = parseRatio(size)
   if (ratio === undefined) return explicit[0]
   return explicit.reduce((best, value) => Math.abs(Math.log(parseRatio(value)! / ratio)) < Math.abs(Math.log(parseRatio(best)! / ratio)) ? value : best)
 }

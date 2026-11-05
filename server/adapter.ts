@@ -157,7 +157,7 @@ const refreshing = new Set<string>()
 export async function refreshAccount(accountId: string): Promise<void> {
   if (refreshing.has(accountId)) return
   const account = getAccount(accountId)
-  if (!account || account.inflight > 0 || account.status === 'disabled') return
+  if (!account || account.source === 'openai' || account.inflight > 0 || account.status === 'disabled') return
   refreshing.add(accountId)
   let credentialsChanged = false
   db.run("UPDATE accounts SET status='refreshing' WHERE id=? AND status!='disabled'", [accountId])

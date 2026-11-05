@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS image_model_config (
  id INTEGER PRIMARY KEY CHECK(id=1), models TEXT NOT NULL, default_model TEXT NOT NULL,
  responses_model TEXT NOT NULL DEFAULT 'gpt-6.1-sol'
 );
+CREATE TABLE IF NOT EXISTS openai_api_config (id INTEGER PRIMARY KEY CHECK(id=1), secret TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (
  id TEXT PRIMARY KEY, owner TEXT NOT NULL, client_id TEXT, fingerprint TEXT NOT NULL, prompt TEXT NOT NULL,
  model TEXT NOT NULL, n INTEGER NOT NULL, refs TEXT NOT NULL DEFAULT '[]', demo INTEGER NOT NULL DEFAULT 0,
@@ -70,6 +71,11 @@ CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner,created);
 const taskColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(tasks)').all().map(column => column.name))
 if (!taskColumns.has('size')) db.run("ALTER TABLE tasks ADD COLUMN size TEXT NOT NULL DEFAULT '1024x1024'")
 if (!taskColumns.has('quality')) db.run("ALTER TABLE tasks ADD COLUMN quality TEXT NOT NULL DEFAULT 'auto'")
+if (!taskColumns.has('source')) {
+  db.run("ALTER TABLE tasks ADD COLUMN source TEXT NOT NULL DEFAULT 'codex'")
+  db.run("UPDATE tasks SET source='web' WHERE model='gpt-image-2'")
+}
+if (!taskColumns.has('upstream_model')) db.run('ALTER TABLE tasks ADD COLUMN upstream_model TEXT')
 const modelColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(image_model_config)').all().map(column => column.name))
 if (!modelColumns.has('responses_model')) db.run("ALTER TABLE image_model_config ADD COLUMN responses_model TEXT NOT NULL DEFAULT 'gpt-6.1-sol'")
 const imageColumns = new Set(db.query<{ name: string }, []>('PRAGMA table_info(images)').all().map(column => column.name))
@@ -77,8 +83,19 @@ if (!imageColumns.has('queued_at')) {
   db.run('ALTER TABLE images ADD COLUMN queued_at INTEGER')
   db.run('UPDATE images SET queued_at=(SELECT created FROM tasks WHERE tasks.id=images.task_id)')
 }
-export type Account = { id: string; identity: string; name: string; email: string | null; source: 'web' | 'codex'; plan: string; status: string; quota: number | null; slots: number; inflight: number; success: number; fail: number; cooldown_until: number; last_error: string | null; last_refresh: number | null; last_used: number; created: number; secret: string }
-export type Task = { id: string; owner: string; client_id: string | null; fingerprint: string; prompt: string; model: string; size: string; quality: string; n: number; refs: string; demo: number; status: string; created: number; updated: number; error: string | null }
+// Upgrade the earlier single-key configuration into the normal account pool once.
+db.transaction(() => {
+  const legacy = db.query<{ secret: string }, []>('SELECT secret FROM openai_api_config WHERE id=1').get()
+  if (!legacy) return
+  const value = unseal<{ apiKey: string; concurrency: number }>(legacy.secret)
+  if (value.apiKey) {
+    const identity = hash(`openai:${value.apiKey}`)
+    db.run("INSERT OR IGNORE INTO accounts(id,identity,name,source,plan,status,quota,slots,last_refresh,created,secret) VALUES(?,?,?,'openai','api','ready',NULL,?,?,?,?)", [id('acct'), identity, `OpenAI API · ${value.apiKey.slice(-4)}`, Math.min(30, Math.max(1, Number(value.concurrency) || 5)), Date.now(), Date.now(), seal({ api_key: value.apiKey })])
+  }
+  db.run('DELETE FROM openai_api_config WHERE id=1')
+}).immediate()
+export type Account = { id: string; identity: string; name: string; email: string | null; source: 'web' | 'codex' | 'openai'; plan: string; status: string; quota: number | null; slots: number; inflight: number; success: number; fail: number; cooldown_until: number; last_error: string | null; last_refresh: number | null; last_used: number; created: number; secret: string }
+export type Task = { id: string; owner: string; client_id: string | null; fingerprint: string; prompt: string; model: string; source: 'web' | 'codex' | 'openai'; upstream_model: string | null; size: string; quality: string; n: number; refs: string; demo: number; status: string; created: number; updated: number; error: string | null }
 export type ImageRow = { id: string; task_id: string; position: number; status: string; account_id: string | null; attempts: number; url: string | null; object_key: string | null; local_path: string | null; mime: string | null; bytes: number | null; error: string | null; queued_at: number | null; started: number | null; finished: number | null }
 export type Settings = { queueLimit: number; jobTimeoutSeconds: number; refreshMinutes: number; storage: 'local' | 'oss'; publicBaseUrl: string; oss: { region: string; bucket: string; endpoint: string; accessKeyId: string; accessKeySecret: string; prefix: string; urlExpiry: number }; allowedImageHosts: string[] }
 export const defaults: Settings = { queueLimit: 500, jobTimeoutSeconds: 600, refreshMinutes: 5, storage: 'local', publicBaseUrl: '', oss: { region: '', bucket: '', endpoint: '', accessKeyId: '', accessKeySecret: '', prefix: 'atelier', urlExpiry: 3600 }, allowedImageHosts: [] }
@@ -96,7 +113,8 @@ export function publicSettings() {
 }
 export function publicAccount(account: Account) {
   const { secret, identity, ...rest } = account
-  return { ...rest, hasRefreshToken: !!unseal(secret).refresh_token }
+  const value = unseal(secret)
+  return { ...rest, hasRefreshToken: !!value.refresh_token, keySuffix: account.source === 'openai' ? String(value.api_key || '').slice(-4) : null }
 }
 export const accounts = () => db.query<Account, []>('SELECT * FROM accounts ORDER BY created DESC').all()
 export const getAccount = (value: string) => db.query<Account, [string]>('SELECT * FROM accounts WHERE id=?').get(value)

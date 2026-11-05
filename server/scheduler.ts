@@ -7,6 +7,8 @@ import { fetchReference } from './network'
 import { persistImage, cleanupUploadedFile } from './storage'
 import { accountSource, isUploadedReference, uploadedReferenceFile } from './image-input'
 import { CODEX_IMAGE_PLANS, needsAccountRefresh } from './account-policy'
+import { modelConfiguration } from './image-models'
+import { generateOpenAIImage, OpenAIRequestError } from './openai'
 
 mkdirSync(resolve(dataDir, 'spool'), { recursive: true, mode: 0o700 })
 const running = new Set<string>()
@@ -46,7 +48,8 @@ export function submitTask(input: TaskInput) {
     const queued = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM images WHERE status IN ('queued','generating','uploading')").get()!.count
     if (queued + input.n > settings().queueLimit) throw new Error('队列已满，请稍后重试')
     const taskId = id('task'), now = Date.now()
-    db.run('INSERT INTO tasks(id,owner,client_id,fingerprint,prompt,model,n,refs,demo,created,updated,size,quality) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', [taskId, input.owner, input.clientId || null, fingerprint, input.prompt, input.model, input.n, JSON.stringify(input.refs), input.demo ? 1 : 0, now, now, input.size || '1024x1024', input.quality || 'auto'])
+    const model = modelConfiguration().models.find(model => model.id === input.model)
+    db.run('INSERT INTO tasks(id,owner,client_id,fingerprint,prompt,model,n,refs,demo,created,updated,size,quality,source,upstream_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [taskId, input.owner, input.clientId || null, fingerprint, input.prompt, input.model, input.n, JSON.stringify(input.refs), input.demo ? 1 : 0, now, now, input.size || '1024x1024', input.quality || 'auto', model?.source || accountSource(input.model), model?.upstreamModel || input.model])
     for (let i = 0; i < input.n; i++) db.run('INSERT INTO images(id,task_id,position,queued_at) VALUES(?,?,?,?)', [id('img'), taskId, i, now])
     return getTask(taskId)!
   }).immediate()
@@ -58,7 +61,7 @@ export function claimImage(): { image: ImageRow; task: Task; account: Account | 
       const task = getTask(image.task_id)!
       let account: Account | null = null
       if (!task.demo) {
-        const source = accountSource(task.model)
+        const source = task.source
         // Least-loaded first (inflight relative to slots), then least recently used, so work spreads before any account stacks up.
         account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY CAST(inflight AS REAL)/slots,inflight,last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
         if (!account) continue
@@ -101,7 +104,8 @@ async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
       await fetchReference(reference, path)
       refs.push(path)
     }
-    const result = task.demo ? await demoImage(image.id, image.position) : await generateImage(account!, { prompt: task.prompt, model: task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts })
+    const request = { prompt: task.prompt, model: task.upstream_model || task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts }
+    const result = task.demo ? await demoImage(image.id, image.position) : task.source === 'openai' ? await generateOpenAIImage(account!, { ...request, owner: task.owner }) : await generateImage(account!, request)
     db.transaction(() => {
       db.run("UPDATE images SET status='uploading',local_path=?,mime=?,bytes=? WHERE id=?", [result.path, result.mime, result.bytes, image.id])
       if (account) db.run("UPDATE accounts SET inflight=MAX(0,inflight-1),success=success+1,quota=CASE WHEN quota IS NULL THEN NULL ELSE MAX(0,quota-1) END,status=CASE WHEN status='disabled' THEN 'disabled' WHEN quota=1 THEN 'limited' ELSE status END WHERE id=?", [account.id])
@@ -112,7 +116,8 @@ async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
     const message = safeError(error)
     db.run("UPDATE images SET status='error',error=?,finished=? WHERE id=?", [message, Date.now(), image.id])
     const timedOut = error instanceof AdapterTimeoutError
-    if (account && !slotReleased) db.run(`UPDATE accounts SET fail=fail+1,cooldown_until=?,last_error=?${timedOut ? '' : ',inflight=MAX(0,inflight-1)'} WHERE id=?`, [Date.now() + 60_000, message, account.id])
+    const invalidKey = account?.source === 'openai' && error instanceof OpenAIRequestError && error.status === 401
+    if (account && !slotReleased) db.run(`UPDATE accounts SET fail=fail+1,cooldown_until=?,last_error=?,status=CASE WHEN status='disabled' THEN 'disabled' WHEN ? THEN 'error' ELSE status END${timedOut ? '' : ',inflight=MAX(0,inflight-1)'} WHERE id=?`, [Date.now() + 60_000, message, invalidKey ? 1 : 0, account.id])
     if (timedOut) {
       // The attempt may still be generating upstream: keep its account slot and block retries until the adapter lets it go.
       attemptEnded = error.settled
