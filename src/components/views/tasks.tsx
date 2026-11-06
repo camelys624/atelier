@@ -4,7 +4,7 @@ import { toast } from 'sonner'
 import { Button } from '../ui/button'
 import { Input, Textarea } from '../ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../ui/dialog'
-import { api, preferredModel, type Snapshot, type Task } from '@/lib/client'
+import { api, modelSourceLabel, preferredModel, type Snapshot, type Task } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { formatDuration, taskTiming } from '@/lib/timing'
 import { EmptyArt, Field, Status, Tabs, short, time } from './shared'
@@ -63,7 +63,7 @@ export function Tasks({ data, create, openTask }: { data: Snapshot; create: () =
 }
 
 export function CreateTask({ open, onOpenChange, data, complete }: { open: boolean; onOpenChange: (value: boolean) => void; data: Snapshot; complete: (task: Task) => Promise<void> }) {
-  const anyReady = data.accounts.some(a => a.status === 'ready')
+  const anyReady = data.models.some(model => model.accounts > 0)
   const [prompt, setPrompt] = useState(''), [model, setModel] = useState(() => preferredModel(data.models)), [n, setN] = useState(7), [urls, setUrls] = useState(''), [demo, setDemo] = useState(!anyReady), [busy, setBusy] = useState(false)
   // Reopening the dialog moves off a model whose accounts are gone, so the default always has a usable account.
   useEffect(() => { if (!open) return; if (!anyReady) setDemo(true); if (!data.models.find(m => m.id === model)?.accounts) setModel(preferredModel(data.models)) }, [open, anyReady, data.models, model])
@@ -85,8 +85,8 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
         <Textarea autoFocus placeholder="例如：一组极简护肤品广告摄影，柔和自然光，鼠尾草绿背景，保持产品风格统一…" rows={4} value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.currentTarget.form?.requestSubmit() } }} required maxLength={12000} />
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field label="生成模型" help={demo ? undefined : usable ? `${usable} 个可用${source === 'codex' ? ' Codex ' : ' ChatGPT '}账号` : <span className="flex items-center gap-1 text-warn-ink"><TriangleAlert size={12} />没有可用的{source === 'codex' ? ' Codex ' : ' ChatGPT '}账号</span>}>
-          <select className="select" value={model} onChange={e => setModel(e.target.value)}>{data.models.map(m => <option key={m.id} value={m.id}>{m.source === 'codex' ? 'Codex' : 'ChatGPT'} · {m.name}{m.accounts ? '' : '（无可用账号）'}</option>)}</select>
+        <Field label="生成模型" help={demo ? undefined : source === 'openai' ? usable ? `${usable} 把可用 OpenAI API Key` : '请先在账号池中添加或启用 OpenAI API Key' : usable ? `${usable} 个可用${source === 'codex' ? ' Codex ' : ' ChatGPT '}账号` : <span className="flex items-center gap-1 text-warn-ink"><TriangleAlert size={12} />没有可用的{source === 'codex' ? ' Codex ' : ' ChatGPT '}账号</span>}>
+          <select className="select" value={model} onChange={e => setModel(e.target.value)}>{data.models.map(m => <option key={m.id} value={m.id}>{modelSourceLabel(m.source)} · {m.name}{m.accounts ? '' : m.source === 'openai' ? '（无可用 API Key）' : '（无可用账号）'}</option>)}</select>
         </Field>
         <Field label="图片数量"><select className="select" value={n} onChange={e => setN(Number(e.target.value))}>{[1, 2, 3, 4, 5, 6, 7].map(value => <option value={value} key={value}>{value} 张{value === 7 ? ' · 一组' : ''}</option>)}</select></Field>
       </div>
@@ -95,7 +95,7 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
       </Field>}
       <label className={cn('flex cursor-pointer items-start gap-3 rounded-xl border p-4', demo ? 'border-warn/40 bg-warn-soft' : 'bg-surface')}>
         <input type="checkbox" className="mt-0.5 accent-warn" checked={demo} onChange={e => setDemo(e.target.checked)} />
-        <div><p className="text-[13px] font-medium text-warn-ink">本地演示模式</p><p className="mt-1.5 text-xs leading-5 text-warn-ink">生成固定的示例预览，用于测试队列和结果查看。不调用 ChatGPT，不消耗账号额度，也不验证 OSS 链路。</p></div>
+        <div><p className="text-[13px] font-medium text-warn-ink">本地演示模式</p><p className="mt-1.5 text-xs leading-5 text-warn-ink">生成固定的示例预览，用于测试队列和结果查看。不调用上游生图服务，不消耗额度，也不验证 OSS 链路。</p></div>
       </label>
       <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-5">
         <span className="text-xs text-muted-foreground">{n} 张图片{!demo && usable > 0 && ` · 当前空闲并发 ${free}，${free >= n ? '可全部立即开始' : free ? `${free} 张立即开始，其余排队` : '全部排队等待'}`}</span>

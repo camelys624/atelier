@@ -68,7 +68,7 @@ async function createTask(request: Request, input: any, who: Identity) {
   const model = String(input.model || defaultImageModel())
   const supported = imageModels().map(item => item.id)
   if (!supported.includes(model)) return bad(`模型未启用或不存在，可使用 ${supported.join('、')}`)
-  const size = normalizeSize(input.size, input.aspect_ratio ?? input.aspectRatio, model), quality = normalizeQuality(input.quality, model)
+  const size = normalizeSize(input.size, model), quality = normalizeQuality(input.quality, model)
   if (input.stream) return bad('第一版提供任务轮询接口，暂不支持流式返回')
   if (input.response_format && !['url', 'b64_json'].includes(input.response_format)) return bad('response_format 只支持 url 或 b64_json')
   if (input.output_format && input.output_format !== 'png') return bad('当前仅支持 output_format=png')
@@ -92,7 +92,8 @@ async function createTask(request: Request, input: any, who: Identity) {
     const pool = accounts().filter(a => a.source === source)
     const others = modelList().filter(m => m.id !== model && m.accounts > 0).map(m => m.id)
     const hint = others.length ? `；当前可用的模型：${others.join('、')}` : ''
-    if (!pool.length) throw new HttpError(409, `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号${hint}`)
+    if (!pool.length) throw new HttpError(409, source === 'openai' ? '请先在账号池中添加 OpenAI API Key' : `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号${hint}`)
+    if (source === 'openai' && !pool.some(usableAccount)) throw new HttpError(409, '没有可用的 OpenAI API Key，请在账号池中启用或更新密钥')
     if (!pool.some(usableAccount)) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型${hint}`)
   }
   await saveReferences(uploads)
@@ -161,7 +162,7 @@ export async function handleApi(request: Request): Promise<Response> {
     }
     if (path === '/api/accounts' && request.method === 'POST') {
       const input = await body(request)
-      const source = input.source === 'codex' ? 'codex' : 'web'
+      const source = input.source === 'openai' ? 'openai' : input.source === 'codex' ? 'codex' : 'web'
       let items = input.items
       if (typeof items === 'string') {
         try { items = JSON.parse(items) } catch { items = items.split(/\r?\n/).filter((s: string) => s.trim()).map((access_token: string) => ({ access_token })) }
@@ -169,6 +170,11 @@ export async function handleApi(request: Request): Promise<Response> {
       if (!Array.isArray(items)) items = [items]
       if (!items.length || items.length > 200) return bad('一次可导入 1～200 个账号')
       if (input.accountId !== undefined && (typeof input.accountId !== 'string' || !input.accountId || items.length !== 1)) return bad('更新凭证时请选择一个账号，并导入一份凭证')
+      if (source === 'openai' && input.accountId) {
+        const existing = getAccount(input.accountId)
+        if (!existing || existing.source !== 'openai') throw new HttpError(404, 'OpenAI API Key 不存在')
+        if (items[0] && typeof items[0] === 'object' && (items[0].api_key === undefined || (typeof items[0].api_key === 'string' && !items[0].api_key.trim()))) items = [{ ...items[0], api_key: unseal(existing.secret).api_key }]
+      }
       const prepared = items.map((item: any) => normalizeAccount(item, source))
       let added = 0
       db.transaction(() => {
@@ -187,10 +193,11 @@ export async function handleApi(request: Request): Promise<Response> {
       if (accountMatch[2] && request.method === 'POST') { await refreshAccount(account.id); return json({ ok: true }) }
       if (request.method === 'PATCH') {
         const input = await body(request)
-        const status = input.enabled === undefined ? account.status : input.enabled ? 'pending' : 'disabled'
+        const status = input.enabled === undefined ? account.status : input.enabled ? account.source === 'openai' ? 'ready' : 'pending' : 'disabled'
         const name = String(input.name || account.name).slice(0, 80)
         const slots = integer(input.slots, account.slots, 1, MAX_ACCOUNT_SLOTS)
         db.run('UPDATE accounts SET name=?,slots=?,status=? WHERE id=?', [name, slots, status, account.id])
+        if (account.source === 'openai' && input.enabled === true) db.run('UPDATE accounts SET last_error=NULL,cooldown_until=0 WHERE id=?', [account.id])
         if (input.enabled) void refreshAccount(account.id).catch(() => {})
         return json({ ok: true })
       }

@@ -2,11 +2,11 @@ import { useEffect, useState } from 'react'
 import { KeyRound, Pause, Play, RefreshCw, Search, ShieldCheck, Trash2, Upload, Users } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
-import { MAX_ACCOUNT_SLOTS, type Account, type Snapshot } from '@/lib/client'
+import { MAX_ACCOUNT_SLOTS, modelSourceLabel, type Account, type Snapshot } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { ConfirmDialog, Status, Tabs, type Action } from './shared'
 
-type Filter = 'all' | 'web' | 'codex'
+type Filter = 'all' | 'web' | 'codex' | 'openai'
 
 function SlotsInput({ account, disabled, save }: { account: Account; disabled: boolean; save: (slots: number) => Promise<unknown> }) {
   const [draft, setDraft] = useState(String(account.slots)), [editing, setEditing] = useState(false)
@@ -25,7 +25,7 @@ function SlotsInput({ account, disabled, save }: { account: Account; disabled: b
 export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; add: () => void; reauthorize: (account: Account) => void; action: Action }) {
   const [filter, setFilter] = useState<Filter>('all'), [query, setQuery] = useState(''), [busy, setBusy] = useState<string | null>(null), [remove, setRemove] = useState<Account | null>(null)
   const q = query.trim().toLowerCase()
-  const rows = data.accounts.filter(a => (filter === 'all' || a.source === filter) && `${a.name} ${a.email || ''}`.toLowerCase().includes(q))
+  const rows = data.accounts.filter(a => (filter === 'all' || a.source === filter) && `${a.name} ${a.email || ''} ${a.keySuffix || ''}`.toLowerCase().includes(q))
   async function run(account: Account, path: string, value?: unknown, method?: string, message?: string) { setBusy(account.id); await action(path, value, method, message); setBusy(null) }
   const totalSuccess = data.accounts.reduce((sum, a) => sum + a.success, 0)
   const ready = data.accounts.filter(a => a.status === 'ready'), inflight = data.accounts.reduce((sum, a) => sum + a.inflight, 0), capacity = ready.reduce((sum, a) => sum + a.slots, 0)
@@ -39,18 +39,19 @@ export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; a
     </section>
     <section className="panel overflow-hidden">
       <div className="panel-heading flex-wrap">
-        <Tabs label="按来源筛选账号" value={filter} onChange={setFilter} items={[{ key: 'all', label: '全部', count: data.accounts.length }, { key: 'web', label: 'ChatGPT', count: data.accounts.filter(a => a.source === 'web').length }, { key: 'codex', label: 'Codex', count: data.accounts.filter(a => a.source === 'codex').length }]} />
-        <div className="relative"><Search size={14} className="absolute left-2.5 top-2 text-faint" /><Input aria-label="搜索账号" placeholder="搜索账号名称或邮箱" className="h-8 w-56 pl-8 text-[13px]" value={query} onChange={e => setQuery(e.target.value)} /></div>
+        <Tabs label="按来源筛选账号" value={filter} onChange={setFilter} items={[{ key: 'all', label: '全部', count: data.accounts.length }, { key: 'web', label: 'ChatGPT', count: data.accounts.filter(a => a.source === 'web').length }, { key: 'codex', label: 'Codex', count: data.accounts.filter(a => a.source === 'codex').length }, { key: 'openai', label: 'OpenAI API', count: data.accounts.filter(a => a.source === 'openai').length }]} />
+        <div className="relative"><Search size={14} className="absolute left-2.5 top-2 text-faint" /><Input aria-label="搜索账号" placeholder="搜索名称、邮箱或 Key 尾号" className="h-8 w-56 pl-8 text-[13px]" value={query} onChange={e => setQuery(e.target.value)} /></div>
       </div>
       {rows.length ? <div className="overflow-x-auto"><table className="w-full min-w-[860px] text-left text-[13px]">
         <thead className="bg-surface text-xs text-muted-foreground"><tr>{['账号', '来源 / 套餐', '状态', '图片额度', '累计成功 / 失败', '并发（占用 / 上限）', ''].map((label, i) => <th className="px-3.5 py-2 font-normal" key={i}>{label}</th>)}</tr></thead>
         <tbody>{rows.map(account => {
           const working = busy === account.id || account.status === 'refreshing', disabled = account.status === 'disabled'
+          const credentialAction = account.source === 'openai' ? '更新 Key' : account.source === 'codex' ? '重新授权' : '更新凭证'
           return <tr key={account.id} className="border-t">
-            <td className="max-w-60 px-3.5 py-2.5"><p className="truncate font-medium">{account.name}</p><p className="mt-1 truncate text-xs text-muted-foreground">{account.email || '等待读取账号资料'}</p>{account.last_error && <p className="mt-2 line-clamp-2 text-xs leading-5 text-bad-ink" title={account.last_error}>{account.last_error}</p>}</td>
-            <td className="px-3.5 py-2.5"><span className="pill">{account.source === 'codex' ? 'Codex' : 'ChatGPT'}</span><p className="mt-1.5 text-xs text-muted-foreground">{account.plan === 'unknown' ? '待识别套餐' : account.plan}</p></td>
+            <td className="max-w-60 px-3.5 py-2.5"><p className="truncate font-medium">{account.name}</p><p className="mt-1 truncate text-xs text-muted-foreground">{account.source === 'openai' ? `API Key · ••••${account.keySuffix || ''}` : account.email || '等待读取账号资料'}</p>{account.last_error && <p className="mt-2 line-clamp-2 text-xs leading-5 text-bad-ink" title={account.last_error}>{account.last_error}</p>}</td>
+            <td className="px-3.5 py-2.5"><span className="pill">{modelSourceLabel(account.source)}</span><p className="mt-1.5 text-xs text-muted-foreground">{account.source === 'openai' ? 'API Key' : account.plan === 'unknown' ? '待识别套餐' : account.plan}</p></td>
             <td className="px-3.5 py-2.5"><Status value={account.status} /></td>
-            <td className="px-3.5 py-2.5 tabular-nums text-soft">{account.quota === null ? <span className="text-muted-foreground" title="当前协议无法独立获取 Codex 图片额度">未获取</span> : `${account.quota} 张`}</td>
+            <td className="px-3.5 py-2.5 tabular-nums text-soft">{account.source === 'openai' ? '按 API 用量' : account.quota === null ? <span className="text-muted-foreground" title="当前协议无法独立获取 Codex 图片额度">未获取</span> : `${account.quota} 张`}</td>
             <td className="px-3.5 py-2.5 tabular-nums" title={totalSuccess ? `占全部成功图片的 ${Math.round(account.success / totalSuccess * 100)}%` : undefined}>
               <p><span className="text-soft">{account.success}</span><span className="text-faint"> / </span><span className={account.fail ? 'text-bad-ink' : 'text-muted-foreground'}>{account.fail}</span></p>
               {totalSuccess > 0 && <div className="mt-1.5 flex items-center gap-2"><div className="h-1 w-16 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-accent" style={{ width: `${account.success / totalSuccess * 100}%` }} /></div><span className="text-xs text-muted-foreground">{Math.round(account.success / totalSuccess * 100)}%</span></div>}
@@ -60,8 +61,8 @@ export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; a
               <SlotsInput account={account} disabled={busy === account.id} save={slots => run(account, `/api/accounts/${account.id}`, { slots }, 'PATCH', `并发上限已设为 ${slots}`)} />
             </div><div className="meter w-[104px]"><span style={{ width: `${Math.min(100, account.inflight / account.slots * 100)}%` }} /></div></td>
             <td className="px-3 py-2.5"><div className="flex justify-end gap-1">
-              <Button size="sm" variant="ghost" className="h-8 shrink-0 px-2 text-xs" aria-label={`${account.source === 'codex' ? '重新授权' : '更新凭证'}${account.name}`} title={account.inflight ? '请等待正在生成的图片完成' : '更新登录凭证，保留账号设置和历史统计'} disabled={working || account.inflight > 0} onClick={() => reauthorize(account)}><KeyRound size={14} />{account.source === 'codex' ? '重新授权' : '更新凭证'}</Button>
-              <button className="row-action" aria-label={`验证${account.name}`} title="验证与刷新" disabled={working} onClick={() => void run(account, `/api/accounts/${account.id}/refresh`, {}, undefined, '账号验证完成')}><RefreshCw size={15} className={working ? 'animate-spin' : ''} /></button>
+              <Button size="sm" variant="ghost" className="h-8 shrink-0 px-2 text-xs" aria-label={`${credentialAction}${account.name}`} title={account.inflight ? '请等待正在生成的图片完成' : '更新凭证，保留账号设置和历史统计'} disabled={working || account.inflight > 0} onClick={() => reauthorize(account)}><KeyRound size={14} />{credentialAction}</Button>
+              {account.source !== 'openai' && <button className="row-action" aria-label={`验证${account.name}`} title="验证与刷新" disabled={working} onClick={() => void run(account, `/api/accounts/${account.id}/refresh`, {}, undefined, '账号验证完成')}><RefreshCw size={15} className={working ? 'animate-spin' : ''} /></button>}
               <button className="row-action" aria-label={disabled ? `启用${account.name}` : `停用${account.name}`} title={disabled ? '启用' : '停用'} disabled={busy === account.id} onClick={() => void run(account, `/api/accounts/${account.id}`, { enabled: disabled }, 'PATCH', disabled ? '账号已启用' : '账号已停用')}>{disabled ? <Play size={15} /> : <Pause size={15} />}</button>
               <button className="row-action hover:!text-red-600" aria-label={`删除${account.name}`} title="删除" onClick={() => setRemove(account)}><Trash2 size={15} /></button>
             </div></td>
@@ -73,7 +74,7 @@ export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; a
           : <><h3 className="font-medium">还没有{filter === 'codex' ? ' Codex ' : filter === 'web' ? ' ChatGPT ' : ''}账号</h3><p className="mx-auto mt-2 max-w-80 text-[13px] leading-6 text-muted-foreground">导入登录凭证并验证，系统会自动识别账号套餐，按空闲名额分配图片任务。</p><Button className="mt-5" size="sm" onClick={add}><Upload />添加账号</Button></>}
       </div>}
     </section>
-    <p className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck size={13} />登录凭证已加密保存。Codex 图片额度暂不作为独立配额展示。</p>
+    <p className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck size={13} />登录凭证和 API Key 已加密保存。Codex 图片额度暂不作为独立配额展示。</p>
     <ConfirmDialog open={!!remove} onOpenChange={open => !open && setRemove(null)} title="删除这个账号？" description={<>将移除「{remove?.name}」的登录凭证，已有任务记录会保留。</>} confirm="删除账号" onConfirm={async () => { if (await action(`/api/accounts/${remove!.id}`, undefined, 'DELETE', '账号已删除')) setRemove(null) }} />
   </div>
 }

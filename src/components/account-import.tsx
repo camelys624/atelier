@@ -6,14 +6,15 @@ import { cn } from '@/lib/utils'
 import { Button } from './ui/button'
 import { Input, Textarea } from './ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
+import { OpenAIAccountForm } from './openai-account'
 
 const isPending = (session: DeviceAuthorization | null) => !!session && ['pending', 'exchanging'].includes(session.status)
 export function AccountImportDialog({ open, onOpenChange, complete, account = null }: { open: boolean; onOpenChange: (value: boolean) => void; complete: () => Promise<void>; account?: Account | null }) {
   const cacheKey = `atelier_device_authorization${account ? `:${account.id}` : ''}`
-  const [mode, setMode] = useState<'authorize' | 'manual'>(account?.source === 'web' ? 'manual' : 'authorize')
+  const [mode, setMode] = useState<'authorize' | 'manual' | 'api'>(account?.source === 'openai' ? 'api' : account?.source === 'web' ? 'manual' : 'authorize')
   const [session, setSession] = useState<DeviceAuthorization | null>(null)
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [now, setNow] = useState(Date.now())
-  const [source, setSource] = useState(account?.source || 'web'), [items, setItems] = useState('')
+  const [source, setSource] = useState<string>(account?.source || 'web'), [items, setItems] = useState('')
   const file = useRef<HTMLInputElement>(null), openRef = useRef(open), sessionRef = useRef(session), completed = useRef('')
   openRef.current = open; sessionRef.current = session
   function remember(value: DeviceAuthorization) {
@@ -87,12 +88,12 @@ export function AccountImportDialog({ open, onOpenChange, complete, account = nu
   const succeeded = session?.status === 'success'
   const failed = session && ['failed', 'expired', 'cancelled'].includes(session.status)
   return <Dialog open={open} onOpenChange={value => value ? onOpenChange(true) : void close()}><DialogContent className="!max-w-[590px]">
-    <DialogTitle className="text-xl font-semibold">{account ? account.source === 'codex' ? '重新授权账号' : '更新账号凭证' : '添加账号'}</DialogTitle>
-    <DialogDescription className="mt-2 text-xs leading-6 text-muted-foreground">{account ? <>为「{account.email || account.name}」更新登录凭证。账号设置和历史统计会保留，无需删除账号。</> : '通过官方页面授权，登录完成后自动加入账号池。'}</DialogDescription>
-    {account?.source !== 'web' && <div className="mb-6 mt-6 flex gap-5 border-b text-xs">
-      {[['authorize', '授权登录'], ['manual', '手动导入']].map(([value, title]) => <button key={value} type="button" disabled={busy} onClick={async () => { if (value === mode) return; try { await cancelPending(); setError(''); setMode(value as typeof mode) } catch { toast.error('请先取消当前授权，再切换方式') } }} className={cn('flex items-center gap-2 border-b-2 pb-3 transition-colors', mode === value ? 'border-accent font-semibold text-accent-text' : 'border-transparent text-muted-foreground')}>{value === 'authorize' ? <KeyRound size={13} /> : <FileJson size={13} />}{title}{value === 'authorize' && <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent-text">推荐</span>}</button>)}
+    <DialogTitle className="text-xl font-semibold">{account ? account.source === 'openai' ? '更新 OpenAI API Key' : account.source === 'codex' ? '重新授权账号' : '更新账号凭证' : '添加账号'}</DialogTitle>
+    <DialogDescription className="mt-2 text-xs leading-6 text-muted-foreground">{account ? <>为「{account.email || account.name}」更新凭证。账号设置和历史统计会保留，无需删除账号。</> : '选择授权登录、手动导入或添加 OpenAI API Key，将凭证加入账号池。'}</DialogDescription>
+    {(!account || account.source === 'codex') && <div className="mb-6 mt-6 flex flex-wrap gap-5 border-b text-xs">
+      {[['authorize', '授权登录'], ['manual', '手动导入'], ...(!account ? [['api', 'OpenAI API Key']] : [])].map(([value, title]) => <button key={value} type="button" disabled={busy} onClick={async () => { if (value === mode) return; try { await cancelPending(); setError(''); setMode(value as typeof mode) } catch { toast.error('请先取消当前授权，再切换方式') } }} className={cn('flex items-center gap-2 border-b-2 pb-3 transition-colors', mode === value ? 'border-accent font-semibold text-accent-text' : 'border-transparent text-muted-foreground')}>{value !== 'manual' ? <KeyRound size={13} /> : <FileJson size={13} />}{title}{value === 'authorize' && <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] text-accent-text">推荐</span>}</button>)}
     </div>}
-    {mode === 'authorize' ? <div>
+    {mode === 'api' ? <OpenAIAccountForm account={account} complete={complete} close={() => onOpenChange(false)} /> : mode === 'authorize' ? <div>
       {succeeded ? <div className="py-4 text-center"><span className="mx-auto mb-5 flex size-14 items-center justify-center rounded-full bg-ok-soft text-ok-ink"><CheckCheck size={25} /></span><h3 className="text-lg font-medium">授权已完成</h3><p className="mt-2 text-sm text-ok-ink">{session.accountName || (account ? '原账号凭证已更新' : '账号已加入账号池')}</p><p className="mx-auto mt-3 max-w-80 text-[13px] leading-6 text-muted-foreground">{account ? '新的登录与续期凭证已保存，账号设置和历史统计已保留。' : '登录与续期凭证已加密保存。'}<br />{session.accountStatus === 'ready' ? '账号验证已完成，可以参与 Codex 图片任务。' : session.accountStatus === 'error' ? '上游可用性验证未通过，请在账号池查看原因并刷新。' : session.accountStatus === 'disabled' ? '这个账号仍保持停用状态，可在账号池中启用。' : '正在继续验证账号套餐与图片权限，请在账号池查看状态。'}</p><Button className="mt-6" onClick={async () => { await complete(); void close() }}>查看账号池<ChevronRight /></Button></div>
       : <>
         <div className="flex items-start gap-3 rounded-xl border border-border bg-accent-soft p-4"><span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent-text"><ShieldCheck size={17} /></span><div><p className="text-xs font-medium text-accent-text">Codex 设备码授权</p><p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">{account ? `请在官方页面登录 ${account.email || account.name} 并确认，完成后自动更新这个账号的凭证。` : '在 OpenAI 官方页面登录并确认。凭证将加密保存在本服务，作为 Codex 账号参与调度。'}</p></div></div>

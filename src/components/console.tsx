@@ -72,12 +72,12 @@ export function Console({ view }: { view: View }) {
         <span role="status" className={cn('topbar-meta ml-auto flex items-center gap-2 text-xs whitespace-nowrap', networkError ? 'text-bad-ink' : 'text-muted-foreground')}><span className={cn('status-dot', networkError && '!bg-bad !shadow-[0_0_0_3px_var(--bad-soft)]')} />{networkError ? '连接已断开' : '服务运行中 · 每 3 秒更新'}</span>
         <div className="flex items-center gap-2 max-[800px]:ml-auto">
           {view === 'overview' && <Button size="sm" variant="outline" asChild><Link to="/keys"><Code2 /><span className="btn-label">API 接入</span></Link></Button>}
-          {view === 'accounts' ? <Button size="sm" onClick={() => openImport()}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && view !== 'models' && <Button size="sm" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
+          {view === 'accounts' ? <Button size="sm" aria-label="添加账号" onClick={() => openImport()}><Plus /><span className="btn-label">添加账号</span></Button> : view === 'keys' ? <Button size="sm" aria-label="创建密钥" onClick={() => setKeyOpen(true)}><Plus /><span className="btn-label">创建密钥</span></Button> : view !== 'settings' && view !== 'models' && <Button size="sm" aria-label="新建任务" onClick={() => setCreateOpen(true)}><Plus /><span className="btn-label">新建任务</span></Button>}
         </div>
       </header>
       {networkError && <div role="alert" className="flex items-center gap-2 border-b border-bad/30 bg-bad-soft px-5 py-2 text-[13px] text-bad-ink"><WifiOff size={15} />与服务的连接已断开，页面数据可能不是最新，正在自动重连…</div>}
       <div className="content">
-        {view === 'overview' && <Overview data={data} create={() => setCreateOpen(true)} importAccount={() => openImport()} openTask={openTask} createKey={() => setKeyOpen(true)} />}
+        {view === 'overview' && <Overview data={data} create={() => setCreateOpen(true)} openTask={openTask} createKey={() => setKeyOpen(true)} />}
         {view === 'accounts' && <Accounts data={data} add={() => openImport()} reauthorize={openImport} action={action} />}
         {view === 'models' && <Models models={data.configuredModels} responsesModel={data.responsesModel} action={action} />}
         {view === 'tasks' && <Tasks data={data} create={() => setCreateOpen(true)} openTask={openTask} />}

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import OSS from 'ali-oss'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -46,7 +46,7 @@ if (process.argv.includes('--worker')) {
   chmodSync(path, 0o700); stopAdapters()
 }
 async function waitFor(check: () => boolean, timeout = 10_000) { const deadline = Date.now() + timeout; while (!check()) { if (Date.now() > deadline) throw new Error('Timed out'); await Bun.sleep(25) } }
-beforeEach(() => { db.exec('DELETE FROM images; DELETE FROM tasks; DELETE FROM accounts; DELETE FROM api_keys; DELETE FROM sessions; DELETE FROM settings; DELETE FROM device_authorizations; DELETE FROM image_model_config;'); saveSettings(structuredClone(defaults)) })
+beforeEach(() => { db.exec('DELETE FROM images; DELETE FROM tasks; DELETE FROM accounts; DELETE FROM api_keys; DELETE FROM sessions; DELETE FROM settings; DELETE FROM device_authorizations; DELETE FROM image_model_config; DELETE FROM openai_api_config;'); saveSettings(structuredClone(defaults)) })
 afterAll(() => { db.close(); rmSync(temporary, { recursive: true, force: true }) })
 
 describe('web model management', () => {
@@ -138,6 +138,357 @@ describe('web model management', () => {
   })
 })
 
+describe('OpenAI API keys and model mappings', () => {
+  const mockFetch = (handler: (...args: Parameters<typeof globalThis.fetch>) => ReturnType<typeof globalThis.fetch>) => spyOn(globalThis, 'fetch').mockImplementation(Object.assign(handler, { preconnect: globalThis.fetch.preconnect }))
+  const apiKey = 'sk-proj-test-private-key-never-sent-to-upstream'
+  const alias = 'gpt-imag-2.6-sunburst-api', upstream = 'gpt-image-2.6-sunburst'
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+  const configuration = { id: alias, source: 'openai', upstreamModel: upstream, name: 'Sunburst API', qualities: ['auto', 'high', 'max'] }
+  const setup = async (concurrency = 2) => {
+    const response = await request('/api/accounts', { source: 'openai', items: { api_key: apiKey, name: 'primary', slots: concurrency } })
+    const result = await response.json()
+    expect({ status: response.status, error: result.error }).toEqual({ status: 200, error: undefined })
+    expect((await request('/api/models', configuration)).status).toBe(201)
+  }
+  const done = async (id: string) => waitFor(() => ['success', 'error', 'partial'].includes(getTask(id)!.status))
+  test('manages encrypted keys in the account pool and never returns their values', async () => {
+    await setup()
+    const primary = store.accounts()[0]
+    expect(primary.source).toBe('openai')
+    expect(primary.secret).not.toContain(apiKey)
+    expect(unseal(primary.secret)).toEqual({ api_key: apiKey })
+    expect((await request('/api/accounts', { source: 'openai', accountId: primary.id, items: { api_key: '', slots: 3 } })).status).toBe(200)
+    expect(unseal(store.getAccount(primary.id)!.secret).api_key).toBe(apiKey)
+    expect(store.getAccount(primary.id)!.slots).toBe(3)
+    for (const path of ['/api/models', '/api/bootstrap', '/v1/models']) expect(await (await request(path)).text()).not.toContain(apiKey)
+    const snapshot = await (await request('/api/bootstrap')).json()
+    expect(snapshot.accounts[0]).toMatchObject({ source: 'openai', keySuffix: apiKey.slice(-4), hasRefreshToken: false, status: 'ready' })
+    const key = await (await request('/api/keys', { name: 'business' })).json()
+    const input = { source: 'openai', items: { api_key: apiKey } }
+    expect((await request('/api/accounts', input, { Authorization: `Bearer ${key.key}` })).status).toBe(403)
+    expect((await request('/api/accounts', input, {})).status).toBe(401)
+    expect((await request('/api/accounts', input, { Origin: 'https://untrusted.example' })).status).toBe(403)
+    expect((await request(`/api/accounts/${primary.id}`, { enabled: false }, admin, 'PATCH')).status).toBe(200)
+    expect((await (await request('/v1/models')).json()).data.find((m: any) => m.id === alias).available).toBe(false)
+    expect((await request(`/api/accounts/${primary.id}`, { enabled: true }, admin, 'PATCH')).status).toBe(200)
+    expect(store.getAccount(primary.id)!.status).toBe('ready')
+    expect((await request(`/api/accounts/${primary.id}`, undefined, admin, 'DELETE')).status).toBe(200)
+    expect((await request('/v1/image-tasks', { model: alias, prompt: 'test' })).status).toBe(409)
+  })
+  test('validates keys and mappings atomically and preserves the existing account sources', async () => {
+    await setup()
+    const primary = store.accounts()[0], before = primary.secret
+    for (const fields of [{ api_key: 'short' }, { api_key: 1 }, { api_key: apiKey, slots: 0 }, { api_key: apiKey, slots: 31 }, { api_key: apiKey, slots: null }, { api_key: apiKey, slots: 1.5 }, { api_key: apiKey, baseUrl: 'http://untrusted.example' }]) expect((await request('/api/accounts', { source: 'openai', accountId: primary.id, items: fields })).status).toBe(400)
+    expect(store.getAccount(primary.id)!.secret).toBe(before)
+    for (const fields of [{}, { upstreamModel: '' }, { upstreamModel: 'https://untrusted.example' }, { upstreamModel: 1 }]) expect((await request('/api/models', { id: 'invalid-api-model', source: 'openai', ...fields })).status).toBe(400)
+    expect((await request('/api/models', { id: 'codex-map', source: 'codex', upstreamModel: upstream })).status).toBe(400)
+    expect((await request(`/api/models/${alias}`, { source: 'codex' }, admin, 'PATCH')).status).toBe(400)
+    const models = (await (await request('/api/models')).json()).models
+    expect(models.find((m: any) => m.id === alias)).toMatchObject({ source: 'openai', upstreamModel: upstream, accounts: 1 })
+    expect(models.find((m: any) => m.id === 'gpt-image-2')).toMatchObject({ source: 'web', accounts: 0 })
+    expect(models.find((m: any) => m.id === upstream)).toMatchObject({ source: 'codex', accounts: 0 })
+  })
+  test('deduplicates keys and rotates a selected key without losing its history or overwriting another key', async () => {
+    await setup()
+    const primary = store.accounts()[0], secondKey = `${apiKey}-second`, replacement = `${apiKey}-replacement`
+    expect((await (await request('/api/accounts', { source: 'openai', items: { api_key: apiKey } })).json())).toEqual({ added: 0, updated: 1 })
+    expect(store.accounts()).toHaveLength(1)
+    await request('/api/accounts', { source: 'openai', items: { api_key: secondKey, name: 'secondary', slots: 1 } })
+    db.run("UPDATE accounts SET status='disabled',success=8,fail=2 WHERE id=?", [primary.id])
+    const update = (key: string) => request('/api/accounts', { source: 'openai', accountId: primary.id, items: { api_key: key, name: 'rotated primary', slots: 3 } })
+    expect((await update(secondKey)).status).toBe(400)
+    expect(unseal(store.getAccount(primary.id)!.secret).api_key).toBe(apiKey)
+    expect((await update(replacement)).status).toBe(200)
+    expect(store.getAccount(primary.id)).toMatchObject({ status: 'disabled', success: 8, fail: 2, name: 'rotated primary', slots: 3 })
+    expect(unseal(store.getAccount(primary.id)!.secret).api_key).toBe(replacement)
+    expect(store.accounts()).toHaveLength(2)
+    expect((await (await request('/api/models')).json()).models.find((m: any) => m.id === alias).accounts).toBe(1)
+    expect(needsAccountRefresh(store.getAccount(primary.id)!, Date.now() + 86400_000, 1)).toBe(false)
+    db.run('UPDATE accounts SET inflight=1 WHERE id=?', [primary.id])
+    expect((await update(apiKey)).status).toBe(400)
+    expect((await request(`/api/accounts/${primary.id}`, undefined, admin, 'DELETE')).status).toBe(409)
+  })
+  test('balances concurrent tasks across multiple keys and enforces each key slot limit', async () => {
+    await setup(2)
+    const secondaryKey = `${apiKey}-secondary`
+    await request('/api/accounts', { source: 'openai', items: { api_key: secondaryKey, name: 'secondary', slots: 1 } })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve }), active = new Map<string, number>(), peak = new Map<string, number>()
+    const fetch = mockFetch(async (_url, init) => {
+      const key = new Headers(init!.headers).get('Authorization')!.slice('Bearer '.length)
+      active.set(key, (active.get(key) || 0) + 1); peak.set(key, Math.max(peak.get(key) || 0, active.get(key)!))
+      await gate
+      active.set(key, active.get(key)! - 1)
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    })
+    let task: any
+    try {
+      task = await (await request('/v1/image-tasks', { model: alias, prompt: 'multiple keys', n: 5 })).json()
+      await waitFor(() => fetch.mock.calls.length === 3)
+      expect(store.accounts().map(account => account.inflight).sort()).toEqual([1, 2])
+      expect((await (await request('/api/models')).json()).models.find((m: any) => m.id === alias).accounts).toBe(2)
+      const busy = store.accounts().find(account => unseal(account.secret).api_key === apiKey)!
+      expect((await request(`/api/accounts/${busy.id}`, undefined, admin, 'DELETE')).status).toBe(409)
+      release(); await done(task.id)
+      expect(getTask(task.id)!.status).toBe('success')
+      expect(peak.get(apiKey)).toBe(2)
+      expect(peak.get(secondaryKey)).toBe(1)
+      expect(store.accounts().reduce((sum, account) => sum + account.success, 0)).toBe(5)
+      expect(store.accounts().every(account => account.inflight === 0)).toBe(true)
+      expect(new Set(taskImages(task.id).map(image => image.account_id)).size).toBe(2)
+    } finally { release(); if (task?.id) await done(task.id); fetch.mockRestore() }
+  })
+  test('isolates an invalid key while other keys keep serving queued jobs without replaying a failed image', async () => {
+    await setup(1)
+    const goodKey = `${apiKey}-good`
+    await request('/api/accounts', { source: 'openai', items: { api_key: goodKey, name: 'good key', slots: 1 } })
+    const fetch = mockFetch(async (_url, init) => new Headers(init!.headers).get('Authorization') === `Bearer ${apiKey}` ? Response.json({ error: { message: `Invalid key ${apiKey}` } }, { status: 401 }) : Response.json({ data: [{ b64_json: png.toString('base64') }] }))
+    try {
+      const task = await (await request('/v1/image-tasks', { model: alias, prompt: 'independent keys', n: 3 })).json()
+      await done(task.id)
+      expect(getTask(task.id)!.status).toBe('partial')
+      const bad = store.accounts().find(account => unseal(account.secret).api_key === apiKey)!, good = store.accounts().find(account => unseal(account.secret).api_key === goodKey)!
+      expect(bad).toMatchObject({ status: 'error', fail: 1, inflight: 0 })
+      expect(bad.last_error).not.toContain(apiKey)
+      expect(good).toMatchObject({ status: 'ready', success: 2, inflight: 0 })
+      expect(taskImages(task.id).every(image => image.attempts === 1)).toBe(true)
+      expect(fetch).toHaveBeenCalledTimes(3)
+    } finally { fetch.mockRestore() }
+  })
+  test('accepts the client alias, calls the mapped official model and stores PNG results against the selected API Key', async () => {
+    await setup()
+    const fetch = mockFetch(async (url, init) => {
+      expect(String(url)).toBe('https://api.openai.com/v1/images/generations')
+      expect(new Headers(init!.headers).get('Authorization')).toBe(`Bearer ${apiKey}`)
+      const body = JSON.parse(String(init!.body))
+      expect(body).toMatchObject({ model: upstream, prompt: 'mapped generation', n: 1, size: '1536x1024', quality: 'max', output_format: 'png' })
+      expect(body.response_format).toBeUndefined()
+      expect(body.safety_identifier).toBe(store.hash('admin'))
+      expect(init!.redirect).toBe('error')
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    })
+    try {
+      const response = await request('/v1/image-tasks', { model: alias, prompt: 'mapped generation', n: 1, size: '1536x1024', quality: 'max' })
+      expect(response.status).toBe(202)
+      const task = await response.json()
+      expect(task.model).toBe(alias)
+      await done(task.id)
+      expect(getTask(task.id)).toMatchObject({ status: 'success', model: alias, source: 'openai', upstream_model: upstream })
+      expect(taskImages(task.id)[0]).toMatchObject({ status: 'success', account_id: store.accounts()[0].id, attempts: 1, mime: 'image/png' })
+      expect(Buffer.from(await Bun.file(taskImages(task.id)[0].local_path!).arrayBuffer())).toEqual(png)
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(store.accounts()).toHaveLength(1)
+      expect(store.accounts()[0]).toMatchObject({ source: 'openai', success: 1, inflight: 0 })
+    } finally { fetch.mockRestore() }
+  })
+  test('matches JSON generation and multipart editing to the closest configured 4K sizes', async () => {
+    await setup()
+    await request(`/api/models/${alias}`, { sizes: ['1024x1024', '1536x1024', '2048x1152', '3840x2160', '2160x3840', 'auto'] }, admin, 'PATCH')
+    const sizes: string[] = []
+    const fetch = mockFetch(async (url, init) => {
+      if (String(url).endsWith('/edits')) {
+        const bytes = await new Response(init!.body).arrayBuffer()
+        sizes.push(String((await new Response(bytes, { headers: init!.headers }).formData()).get('size')))
+      } else sizes.push(JSON.parse(String(init!.body)).size)
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    })
+    try {
+      const generated = await (await request('/v1/images/generations', { model: alias, prompt: 'landscape 4K', size: '4096x2304', async: true })).json()
+      await done(generated.id)
+      expect(getTask(generated.id)!.size).toBe('3840x2160')
+      const form = new FormData()
+      form.set('model', alias); form.set('prompt', 'portrait 4K'); form.set('size', '2304x4096'); form.set('async', 'true')
+      form.append('image[]', new File([png], 'reference.png', { type: 'image/png' }))
+      const edited = await (await handleApi(new Request('http://127.0.0.1:3080/v1/images/edits', { method: 'POST', headers: admin, body: form }))).json()
+      await done(edited.id)
+      expect(getTask(edited.id)!.size).toBe('2160x3840')
+      expect(sizes).toEqual(['3840x2160', '2160x3840'])
+    } finally { fetch.mockRestore() }
+  })
+  test('uses only configured sizes and matches both aspect ratio and resolution', async () => {
+    await setup()
+    const sizes = ['1024x1024', '1536x1024', '1024x1536', '2048x2048', '2048x1152', '3840x2160', '2160x3840', 'auto']
+    expect((await request(`/api/models/${alias}`, { sizes }, admin, 'PATCH')).status).toBe(200)
+    for (const size of sizes) expect(normalizeSize(size, alias)).toBe(size)
+    const cases = [
+      ['4096x2304', '3840x2160'], ['2304x4096', '2160x3840'],
+      ['4000x2666', '3840x2160'], ['1920x1080', '2048x1152'],
+      ['4096x4096', '2048x2048'], ['1001x1024', '1024x1024'],
+      ['512x512', '1024x1024'], ['2880x2880', '2048x2048'],
+    ]
+    for (const [input, expected] of cases) {
+      expect(normalizeSize(input, alias)).toBe(expected)
+      expect(sizes).toContain(normalizeSize(input, alias))
+    }
+    expect(normalizeSize('3840X2160', alias)).toBe('3840x2160')
+    expect(normalizeSize('16:9', alias)).toBe('2048x1152')
+    expect(normalizeSize(undefined, alias)).toBe('1024x1024')
+    expect(normalizeSize('bogus', alias)).toBe('1024x1024')
+    expect((await request(`/api/models/${alias}`, { sizes: ['1024x1024', '1536x1024'] }, admin, 'PATCH')).status).toBe(200)
+    expect(normalizeSize('3840x2160', alias)).toBe('1536x1024')
+    expect(normalizeSize('auto', alias)).toBe('1024x1024')
+    for (const invalid of [['4096x4096'], ['3840x3840'], ['512x512']]) expect((await request(`/api/models/${alias}`, { sizes: invalid }, admin, 'PATCH')).status).toBe(400)
+  })
+  test('uses only size for JSON and multipart dimensions and ignores resolution aliases', async () => {
+    await setup()
+    const sizes = ['1024x1024', '1536x1024', '2048x2048', '2048x1152', '3840x2160', '2160x3840', 'auto']
+    expect((await request(`/api/models/${alias}`, { sizes }, admin, 'PATCH')).status).toBe(200)
+    const received: { size: string; quality: string }[] = []
+    const fetch = mockFetch(async (url, init) => {
+      const body = String(url).endsWith('/edits')
+        ? Object.fromEntries(await new Response(await new Response(init!.body).arrayBuffer(), { headers: init!.headers }).formData())
+        : JSON.parse(String(init!.body))
+      for (const field of ['resolution', 'image_size', 'imageSize', 'aspect_ratio', 'aspectRatio']) expect(body[field]).toBeUndefined()
+      received.push({ size: String(body.size), quality: String(body.quality) })
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    })
+    try {
+      const cases: [Record<string, string>, string][] = [
+        [{ size: '3840x2160', resolution: '1K', image_size: '1024x1024', imageSize: '2K', aspect_ratio: '9:16', aspectRatio: '1:1' }, '3840x2160'],
+        [{ resolution: '4K', image_size: '2160x3840', imageSize: '3840x2160', aspect_ratio: '9:16', aspectRatio: '16:9' }, '1024x1024'],
+        [{ size: '4K', resolution: '3840x2160' }, '1024x1024'],
+        [{ size: 'auto', resolution: '4K' }, 'auto'],
+      ]
+      for (const [options, expected] of cases) {
+        const response = await request('/v1/images/generations', { model: alias, prompt: 'resolution tier', ...options, quality: 'high', async: true })
+        expect(response.status).toBe(202)
+        const task = await response.json()
+        await done(task.id)
+        expect(getTask(task.id)).toMatchObject({ size: expected, quality: 'high', status: 'success' })
+        expect(received.at(-1)).toEqual({ size: expected, quality: 'high' })
+      }
+      const form = new FormData()
+      form.set('model', alias); form.set('prompt', 'multipart pixel size'); form.set('size', '2160x3840'); form.set('resolution', '1K'); form.set('aspect_ratio', '16:9'); form.set('quality', 'max'); form.set('async', 'true')
+      form.append('image[]', new File([png], 'reference.png', { type: 'image/png' }))
+      const response = await handleApi(new Request('http://127.0.0.1:3080/v1/images/edits', { method: 'POST', headers: admin, body: form }))
+      expect(response.status).toBe(202)
+      const task = await response.json()
+      await done(task.id)
+      expect(getTask(task.id)).toMatchObject({ size: '2160x3840', quality: 'max', status: 'success' })
+      expect(received.at(-1)).toEqual({ size: '2160x3840', quality: 'max' })
+      expect(fetch).toHaveBeenCalledTimes(cases.length + 1)
+    } finally { fetch.mockRestore() }
+  })
+  test('sends uploaded edit references in order through the official multipart API and returns SDK base64', async () => {
+    await setup()
+    const largeReference = Buffer.concat([png, Buffer.alloc(1024 * 1024, 42)])
+    let received: FormData | undefined
+    const upstreamServer = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+      received = await request.formData()
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    } })
+    const originalFetch = globalThis.fetch
+    const fetch = mockFetch(async (url, init) => {
+      expect(String(url)).toBe('https://api.openai.com/v1/images/edits')
+      expect(new Headers(init!.headers).get('Content-Type')).toMatch(/^multipart\/form-data; boundary=/)
+      expect(new Headers(init!.headers).get('Authorization')).toBe(`Bearer ${apiKey}`)
+      return originalFetch(`http://127.0.0.1:${upstreamServer.port}/v1/images/edits`, init)
+    })
+    try {
+      const form = new FormData()
+      form.set('model', alias); form.set('prompt', 'edit references'); form.set('size', '1024x1536'); form.set('quality', 'high'); form.set('response_format', 'b64_json'); form.set('n', '1')
+      form.append('image[]', new File([largeReference], 'a.png', { type: 'image/png' }))
+      form.append('image[]', new File([largeReference, 'second'], 'b.png', { type: 'image/png' }))
+      const response = await handleApi(new Request('http://127.0.0.1:3080/v1/images/edits', { method: 'POST', headers: admin, body: form }))
+      const result = await response.json()
+      expect({ status: response.status, error: result.error }).toEqual({ status: 200, error: undefined })
+      expect(result.data[0].b64_json).toBe(png.toString('base64'))
+      expect(received!.get('model')).toBe(upstream)
+      expect(received!.get('size')).toBe('1024x1536')
+      expect(received!.get('quality')).toBe('high')
+      const files = received!.getAll('image[]') as File[]
+      expect(files.map(file => file.name)).toEqual(['reference-0.png', 'reference-1.png'])
+      expect(Buffer.from(await files[0].arrayBuffer())).toEqual(largeReference)
+      expect(Buffer.from(await files[1].arrayBuffer())).toEqual(Buffer.concat([largeReference, Buffer.from('second')]))
+      expect(fetch).toHaveBeenCalledTimes(1)
+    } finally { fetch.mockRestore(); upstreamServer.stop(true) }
+  })
+  test('shares API concurrency across models and keeps queued mappings after edit, disable and removal', async () => {
+    await setup(2)
+    expect((await request('/api/models', { ...configuration, id: 'second-api-alias' })).status).toBe(201)
+    let release!: () => void, active = 0, peak = 0
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const fetch = mockFetch(async (_url, init) => {
+      expect(JSON.parse(String(init!.body)).model).toBe(upstream)
+      active++; peak = Math.max(peak, active)
+      await gate
+      active--
+      return Response.json({ data: [{ b64_json: png.toString('base64') }] })
+    })
+    let first: any, second: any
+    try {
+      first = await (await request('/v1/image-tasks', { model: alias, prompt: 'first', n: 3 })).json()
+      second = await (await request('/v1/image-tasks', { model: 'second-api-alias', prompt: 'second', n: 2 })).json()
+      await waitFor(() => fetch.mock.calls.length === 2)
+      expect(store.accounts()[0].inflight).toBe(2)
+      expect(taskImages(first.id).filter(image => image.status === 'generating')).toHaveLength(2)
+      expect((await request(`/api/models/${alias}`, { upstreamModel: 'gpt-image-2.6-flare', enabled: false }, admin, 'PATCH')).status).toBe(200)
+      expect((await request(`/api/models/${alias}`, undefined, admin, 'DELETE')).status).toBe(200)
+      release(); await done(first.id); await done(second.id)
+      expect([getTask(first.id)!.status, getTask(second.id)!.status]).toEqual(['success', 'success'])
+      expect(peak).toBe(2)
+      expect(fetch).toHaveBeenCalledTimes(5)
+    } finally { release(); if (first?.id) await done(first.id); if (second?.id) await done(second.id); fetch.mockRestore() }
+  })
+  test('redacts provider errors, never retries failed paid generations and releases capacity', async () => {
+    await setup(1)
+    const fetch = mockFetch(async () => Response.json({ error: { message: `Invalid API key: ${apiKey}` } }, { status: 401 }))
+    try {
+      const task = await (await request('/v1/image-tasks', { model: alias, prompt: 'failure' })).json()
+      await done(task.id)
+      expect(getTask(task.id)!.status).toBe('error')
+      expect(taskImages(task.id)[0].error).toContain('HTTP 401')
+      expect(taskImages(task.id)[0].error).not.toContain(apiKey)
+      expect(taskImages(task.id)[0].attempts).toBe(1)
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(store.accounts()[0]).toMatchObject({ inflight: 0, status: 'error', fail: 1 })
+    } finally { fetch.mockRestore() }
+  })
+  test('a disconnected edit reports an uncertain result, removes upload artifacts and never replays the request', async () => {
+    await setup(1)
+    const reference = Buffer.concat([png, Buffer.alloc(1024 * 1024, 42)])
+    const fetch = mockFetch(async (_url, init) => {
+      const bytes = await new Response(init!.body).arrayBuffer()
+      const form = await new Response(bytes, { headers: init!.headers }).formData()
+      expect(form.get('model')).toBe(upstream)
+      expect((form.getAll('image[]') as File[]).map(file => file.size)).toEqual([reference.length, reference.length])
+      throw new Error('The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()')
+    })
+    try {
+      const form = new FormData()
+      form.set('model', alias); form.set('prompt', 'connection failure'); form.set('async', 'true')
+      form.append('image[]', new File([reference], 'first.png', { type: 'image/png' }))
+      form.append('image[]', new File([reference], 'second.png', { type: 'image/png' }))
+      const response = await handleApi(new Request('http://127.0.0.1:3080/v1/images/edits', { method: 'POST', headers: admin, body: form }))
+      expect(response.status).toBe(202)
+      const task = await response.json()
+      await done(task.id)
+      const image = taskImages(task.id)[0]
+      expect(image.error).toContain('OpenAI API 连接中断')
+      expect(image.error).toContain('上游可能已处理请求')
+      expect(image.error).not.toContain('verbose: true')
+      expect(image).toMatchObject({ status: 'error', attempts: 1, local_path: null })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      expect(store.accounts()[0]).toMatchObject({ status: 'ready', inflight: 0, fail: 1 })
+      expect(readdirSync(join(temporary, 'spool')).filter(file => file.startsWith(image.id))).toEqual([])
+    } finally { fetch.mockRestore() }
+  })
+  test('rejects malformed result bodies and does not fetch provider result URLs', async () => {
+    await setup(1)
+    const fetch = spyOn(globalThis, 'fetch')
+    try {
+      for (const data of [{ data: [{ url: 'https://untrusted.example/result.png' }] }, { data: [{ b64_json: 'invalid base64' }] }, { data: [{ b64_json: Buffer.from('not PNG').toString('base64') }] }]) {
+        db.run("UPDATE accounts SET cooldown_until=0 WHERE source='openai'")
+        fetch.mockResolvedValueOnce(Response.json(data))
+        const task = await (await request('/v1/image-tasks', { model: alias, prompt: 'invalid output' })).json()
+        await done(task.id)
+        expect(getTask(task.id)!.status).toBe('error')
+      }
+      expect(fetch).toHaveBeenCalledTimes(3)
+    } finally { fetch.mockRestore() }
+  })
+})
+
 describe('image edit SDK compatibility', () => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
   function form(fields: Record<string, string> = {}, files: Blob[] = [new Blob([png], { type: 'image/png' })], key = 'image[]') {
@@ -225,7 +576,7 @@ describe('image edit SDK compatibility', () => {
     expect(normalizeSize(undefined)).toBe('1024x1024'); expect(normalizeSize('auto')).toBe('auto'); expect(normalizeSize('bogus')).toBe('1024x1024')
     expect(normalizeSize('1792x1024')).toBe('1536x1024'); expect(normalizeSize('1024x1792')).toBe('1024x1536'); expect(normalizeSize('4096x4096')).toBe('1024x1024')
     expect(normalizeSize('16:9')).toBe('1536x1024'); expect(normalizeSize('9:16')).toBe('1024x1536'); expect(normalizeSize('4:3')).toBe('1536x1024'); expect(normalizeSize('6:5')).toBe('1024x1024')
-    expect(normalizeSize('2K', '21:9')).toBe('1536x1024'); expect(normalizeSize('4K')).toBe('1024x1024')
+    expect(normalizeSize('2K')).toBe('1024x1024'); expect(normalizeSize('4K')).toBe('1024x1024')
     expect(normalizeQuality('hd', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('standard', 'gpt-image-2')).toBe('medium')
     expect(normalizeQuality('max', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('max', 'gpt-image-2.5-sunburst')).toBe('max')
     expect(normalizeQuality('ultra', 'gpt-image-2')).toBe('high'); expect(normalizeQuality('bogus', 'gpt-image-2')).toBe('auto'); expect(normalizeQuality(undefined, 'gpt-image-2')).toBe('auto')

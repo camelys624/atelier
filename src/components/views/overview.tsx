@@ -17,13 +17,13 @@ function HourlyBars({ hourly, now }: { hourly: Snapshot['hourly']; now: number }
   </div>
 }
 
-export function Overview({ data, create, importAccount, openTask, createKey }: { data: Snapshot; create: () => void; importAccount: () => void; openTask: (id: string) => void; createKey: () => void }) {
+export function Overview({ data, create, openTask, createKey }: { data: Snapshot; create: () => void; openTask: (id: string) => void; createKey: () => void }) {
   const ready = data.accounts.filter(a => a.status === 'ready')
   const pending = data.accounts.filter(a => ['pending', 'refreshing'].includes(a.status)).length, disabled = data.accounts.filter(a => a.status === 'disabled').length
   const queued = data.counts.queued || 0, generating = data.accounts.reduce((sum, a) => sum + a.inflight, 0), capacity = ready.reduce((sum, a) => sum + a.slots, 0)
   const delivered = data.delivered.success || 0, failed = data.delivered.error || 0, finished = delivered + failed, today = data.hourly.reduce((sum, item) => sum + item.count, 0)
   const setup = [
-    { label: '授权添加第一个账号', done: ready.length > 0, action: importAccount },
+    { label: '配置生图来源', done: ready.length > 0, to: '/accounts' as const },
     { label: '创建业务 API 密钥', done: data.keys.some(k => k.enabled), action: createKey },
     { label: '连接 OSS 图片存储', done: data.settings.storage === 'oss', to: '/settings' as const },
   ]
@@ -79,7 +79,7 @@ export function Overview({ data, create, importAccount, openTask, createKey }: {
           <div className="panel-heading"><h2 className="panel-title">模型</h2><Link to="/keys" className="flex items-center gap-1 text-xs font-medium text-accent-text hover:underline">接入方式<ArrowRight size={12} /></Link></div>
           <div className="py-1">{data.models.map(model => <div key={model.id} className="flex items-center gap-2 px-3.5 py-1.5">
             <code className="truncate font-mono text-xs">{model.id}</code>
-            <span className={cn('pill ml-auto', model.accounts ? 'green' : 'amber')}>{model.accounts ? `${model.accounts} 个账号` : '无可用账号'}</span>
+            <span className={cn('pill ml-auto', model.accounts ? 'green' : 'amber')}>{model.source === 'openai' ? model.accounts ? `${model.accounts} 把 API Key` : '无可用 API Key' : model.accounts ? `${model.accounts} 个账号` : '无可用账号'}</span>
           </div>)}</div>
         </section>
       </div>

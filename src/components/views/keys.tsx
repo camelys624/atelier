@@ -4,7 +4,7 @@ import { toast } from 'sonner'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '../ui/dialog'
-import { api, preferredModel, type ApiKey, type Snapshot } from '@/lib/client'
+import { api, modelSourceLabel, preferredModel, type ApiKey, type Snapshot } from '@/lib/client'
 import { cn } from '@/lib/utils'
 import { ConfirmDialog, Field, Status, copy, time, type Action } from './shared'
 
@@ -30,14 +30,14 @@ export function Keys({ data, add, action }: { data: Snapshot; add: () => void; a
       </div>}
     </section>
     <section className="panel overflow-hidden">
-      <div className="panel-heading"><h2 className="panel-title">模型列表</h2><span className="text-xs text-muted-foreground">请求中的 model 参数；每个模型只能由对应来源的账号生成</span></div>
+      <div className="panel-heading"><h2 className="panel-title">模型列表</h2><span className="text-xs text-muted-foreground">请求中的 model 参数；按配置调用对应来源</span></div>
       <div className="overflow-x-auto"><table className="w-full min-w-[640px] text-left text-[13px]">
-        <thead className="bg-surface text-xs text-muted-foreground"><tr>{['模型 ID', '名称', '所需账号', '状态'].map(label => <th key={label} className="px-3.5 py-2 font-normal">{label}</th>)}</tr></thead>
+        <thead className="bg-surface text-xs text-muted-foreground"><tr>{['模型 ID', '名称', '调用来源', '状态'].map(label => <th key={label} className="px-3.5 py-2 font-normal">{label}</th>)}</tr></thead>
         <tbody>{data.models.map(item => <tr key={item.id} className="border-t">
           <td className="px-3.5 py-2.5"><div className="flex items-center gap-1"><code className="font-mono text-[13px]">{item.id}</code><button className="row-action" aria-label={`复制 ${item.id}`} onClick={() => void copy(item.id, '模型 ID 已复制')}><Copy size={13} /></button></div></td>
           <td className="px-3.5 py-2.5"><p>{item.name}</p><p className="mt-1 text-xs text-muted-foreground">{item.description}</p></td>
-          <td className="px-3.5 py-2.5"><span className="pill">{item.source === 'codex' ? 'Codex' : 'ChatGPT 网页'}</span></td>
-          <td className="px-3.5 py-2.5">{item.accounts ? <span className="pill green"><span className="size-1.5 rounded-full bg-current" />{item.accounts} 个可用账号</span> : <span className="pill amber"><span className="size-1.5 rounded-full bg-current" />无可用账号</span>}</td>
+          <td className="px-3.5 py-2.5"><span className="pill">{modelSourceLabel(item.source)}</span></td>
+          <td className="px-3.5 py-2.5">{item.accounts ? <span className="pill green"><span className="size-1.5 rounded-full bg-current" />{item.source === 'openai' ? `${item.accounts} 把可用 API Key` : `${item.accounts} 个可用账号`}</span> : <span className="pill amber"><span className="size-1.5 rounded-full bg-current" />{item.source === 'openai' ? '无可用 API Key' : '无可用账号'}</span>}</td>
         </tr>)}</tbody>
       </table></div>
       {missingWeb && <p className="border-t px-3.5 py-2.5 text-xs leading-6 text-muted-foreground">「授权登录」添加的是 Codex 账号，可使用列表中所需账号为 Codex 的模型；ChatGPT 网页来源的模型需要在「添加账号 → 手动导入」中添加对应账号。</p>}
