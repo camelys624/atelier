@@ -71,10 +71,10 @@ export function Accounts({ data, add, reauthorize, action }: { data: Snapshot; a
       </table></div> : <div className="py-20 text-center">
         <div className="mx-auto mb-5 flex size-16 items-center justify-center rounded-2xl border bg-muted text-faint"><Users size={25} strokeWidth={1.3} /></div>
         {q ? <><h3 className="font-medium">没有匹配的账号</h3><p className="mt-2 text-[13px] text-muted-foreground">换个关键词试试。</p><Button className="mt-5" size="sm" variant="outline" onClick={() => setQuery('')}>清除搜索</Button></>
-          : <><h3 className="font-medium">还没有{filter === 'codex' ? ' Codex ' : filter === 'web' ? ' ChatGPT ' : ''}账号</h3><p className="mx-auto mt-2 max-w-80 text-[13px] leading-6 text-muted-foreground">导入登录凭证并验证，系统会自动识别账号套餐，按空闲名额分配图片任务。</p><Button className="mt-5" size="sm" onClick={add}><Upload />添加账号</Button></>}
+          : <><h3 className="font-medium">还没有{filter === 'codex' ? ' Codex ' : filter === 'web' ? ' ChatGPT 网页 ' : ''}账号</h3><p className="mx-auto mt-2 max-w-80 text-[13px] leading-6 text-muted-foreground">{filter === 'web' ? '网页来源账号请在「添加账号 → 手动导入」里选「ChatGPT 网页登录」并粘贴凭证；设备码授权添加的是 Codex 来源账号，它同样能生成网页模型。' : '导入登录凭证并验证，系统会自动识别账号套餐，按空闲名额分配图片任务。'}</p><Button className="mt-5" size="sm" onClick={add}><Upload />添加账号</Button></>}
       </div>}
     </section>
-    <p className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck size={13} />登录凭证和 API Key 已加密保存。Codex 图片额度暂不作为独立配额展示。</p>
+    <p className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldCheck size={13} />登录凭证和 API Key 已加密保存。来源按凭证签发方式区分：设备码授权的账号标为 Codex，也能生成网页来源的 gpt-image-2 且不消耗 Codex 额度；需要「ChatGPT 网页」来源的账号请用「手动导入」。Codex 图片额度暂不作为独立配额展示。</p>
     <ConfirmDialog open={!!remove} onOpenChange={open => !open && setRemove(null)} title="删除这个账号？" description={<>将移除「{remove?.name}」的登录凭证，已有任务记录会保留。</>} confirm="删除账号" onConfirm={async () => { if (await action(`/api/accounts/${remove!.id}`, undefined, 'DELETE', '账号已删除')) setRemove(null) }} />
   </div>
 }

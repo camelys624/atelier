@@ -118,6 +118,29 @@ class ImageEditProtocolTests(unittest.TestCase):
         backend.close.assert_called_once()
         self.assertEqual(backend.codex_responses_model, 'configured-calling-model')
 
+    def test_web_source_uses_the_web_protocol_on_a_codex_account(self):
+        from services import openai_backend_api
+        from services.protocol import conversation
+        raw = b'web protocol png'
+        backend = Mock()
+
+        def web_outputs(target, request, index=1, total=1):
+            self.assertIs(target, backend)
+            self.assertEqual((request.model, request.size, request.quality), ('gpt-image-2', '1536x1024', 'high'))
+            yield conversation.ImageOutput(kind='result', model=request.model, index=index, total=total, data=[{'b64_json': base64.b64encode(raw).decode()}])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.png'
+            payload = {'action': 'generate', 'source': 'web', 'account': {'source_type': 'codex', 'access_token': 'test-web-token'}, 'model': 'gpt-image-2', 'prompt': 'web prompt', 'size': '1536x1024', 'quality': 'high', 'output': str(output)}
+            with patch.object(openai_backend_api, 'OpenAIBackendAPI', return_value=backend), patch.object(conversation, 'stream_image_outputs', side_effect=web_outputs) as web, patch('sys.stdin', io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                runpy.run_path(str(Path(__file__).with_name('bridge.py')))
+            result = json.loads(stdout.getvalue())
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(output.read_bytes(), raw)
+        web.assert_called_once()
+        backend.iter_codex_image_response_events.assert_not_called()
+        backend.close.assert_called_once()
+
     def test_tool_payload_uses_requested_model_and_edit_settings(self):
         backend = self.backend()
         backend._iter_codex_response_events = Mock(return_value=iter([]))

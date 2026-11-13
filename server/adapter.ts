@@ -182,12 +182,12 @@ export async function refreshAccount(accountId: string): Promise<void> {
 export function safeError(error: unknown) {
   return String(error instanceof Error ? error.message : error).replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/eyJ[A-Za-z0-9_.-]{30,}/g, '[redacted]').replace(/https?:\/\/[^\s]+/g, '[upstream]').slice(0, 350)
 }
-export async function generateImage(account: Account, request: { prompt: string; model: string; size: string; quality: string; images: string[]; imageId: string; attempt: number }) {
+export async function generateImage(account: Account, request: { prompt: string; model: string; size: string; quality: string; images: string[]; imageId: string; attempt: number; source: string }) {
   // Each attempt writes its own file, so a timed-out attempt that finishes late can never overwrite a retry.
   const output = resolve(dataDir, 'spool', `${request.imageId}.${request.attempt}.png`)
   const discard = () => Promise.all([output, output.replace(/\.png$/, '.part')].map(path => unlink(path).catch(() => {})))
   try {
-    const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), prompt: request.prompt, model: request.model, responses_model: modelConfiguration().responsesModel, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
+    const result = await bridge({ action: 'generate', accountId: account.id, account: credentials(account), source: request.source, prompt: request.prompt, model: request.model, responses_model: modelConfiguration().responsesModel, size: request.size, quality: request.quality, images: request.images, output, timeout: settings().jobTimeoutSeconds })
     return { path: output, mime: result.mime || 'image/png', bytes: result.bytes }
   } catch (error) {
     void (error instanceof AdapterTimeoutError ? error.settled.then(discard) : discard())

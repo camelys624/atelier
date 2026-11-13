@@ -178,7 +178,11 @@ def execute(request=None):
             return {'info': info, 'credentials': credential_values(values)}
         from services.protocol import conversation
         conversation.format_image_result = format_result
-        codex = values.get('source_type') == 'codex'
+        # The task source picks the protocol. A web task may run on a Codex OAuth account: it shares the
+        # chatgpt.com backend scope and the web conversation path does not consume Codex image quota.
+        # Only the credential refresh below still looks at the account source.
+        task_source = str(request.get('source') or '').strip().lower()
+        codex = (task_source == 'codex') if task_source in ('web', 'codex') else values.get('source_type') == 'codex'
         image_request = conversation.ConversationRequest(
             prompt=request['prompt'], model=request['model'], n=1,
             images=request.get('images') or [], size=request.get('size') or '1024x1024',

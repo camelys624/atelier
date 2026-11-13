@@ -20,7 +20,7 @@ const { CODEX_CLIENT_ID, WEB_CLIENT_ID, normalizeAccount, saveAccount } = await 
 const { MAX_UPLOAD_BYTES, referencePath, uploadedReference, saveReferences, normalizeSize, normalizeQuality } = await import('../server/image-input')
 const { imageBase64 } = await import('../server/storage')
 const { AdapterTimeoutError, bridge, refreshAccount, stopAdapters, adapterStats } = await import('../server/adapter')
-const { needsAccountRefresh } = await import('../server/account-policy')
+const { canRunSource, needsAccountRefresh } = await import('../server/account-policy')
 const { cleanupImages } = await import('../server/retention')
 const { db, defaults, seal, unseal, getTask, taskImages, saveSettings } = store
 const admin = { Authorization: `Bearer ${process.env.ADMIN_KEY}` }
@@ -1122,16 +1122,36 @@ describe('durable queue and resource reservations', () => {
     expect(scheduler.claimImage()!.account!.id).toBe('prolite-codex')
     expect(store.getAccount('prolite-codex')!.inflight).toBe(1)
   })
-  test('explains account source mismatches without asking users to reimport a valid account', async () => {
+  test('dispatches web models on a Codex account over the web protocol, without using Codex models', async () => {
+    const previous = process.env.PYTHON_BIN, fake = join(temporary, 'fake-source-routing-adapter'), capture = join(temporary, 'source-routing-request.json')
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+    fakeAdapter(fake, `await Bun.write(${JSON.stringify(capture)},JSON.stringify(p)); await Bun.write(p.output,Buffer.from(${JSON.stringify(png.toString('base64'))},'base64')); return {ok:true,mime:'image/png',bytes:${png.length}}`)
+    process.env.PYTHON_BIN = fake
     account('codex-only')
     db.run("UPDATE accounts SET source='codex',plan='prolite' WHERE id='codex-only'")
-    const response = await request('/v1/image-tasks', { model: 'gpt-image-2', prompt: 'source mismatch' })
-    expect(response.status).toBe(409)
-    const message = (await response.json()).error.message
-    expect(message).toContain('ChatGPT 网页来源账号')
-    expect(message).toContain('当前可用的模型：codex-gpt-image-2、gpt-image-2.5-sunburst')
-    const models = (await (await request('/v1/models')).json()).data
-    expect(Object.fromEntries(models.map((m: any) => [m.id, m.available]))).toEqual({ 'gpt-image-2': false, 'codex-gpt-image-2': true, 'gpt-image-2.5-sunburst': true, 'gpt-image-2.6-sunburst': true, 'gpt-image-2.6-flare': true })
+    try {
+      const models = (await (await request('/v1/models')).json()).data
+      expect(Object.fromEntries(models.map((m: { id: string; available: boolean }) => [m.id, m.available]))).toEqual({ 'gpt-image-2': true, 'codex-gpt-image-2': true, 'gpt-image-2.5-sunburst': true, 'gpt-image-2.6-sunburst': true, 'gpt-image-2.6-flare': true })
+      const web = await (await request('/v1/image-tasks', { model: 'gpt-image-2', prompt: 'web protocol' })).json()
+      await waitFor(() => getTask(web.id)!.status === 'success')
+      // The adapter receives the task source, so it can pick the web conversation protocol on a Codex credential.
+      expect(await Bun.file(capture).json()).toMatchObject({ source: 'web', model: 'gpt-image-2', account: { source_type: 'codex' } })
+      expect(taskImages(web.id)[0].account_id).toBe('codex-only')
+      const codex = await (await request('/v1/image-tasks', { model: 'codex-gpt-image-2', prompt: 'codex protocol' })).json()
+      await waitFor(() => getTask(codex.id)!.status === 'success')
+      expect(await Bun.file(capture).json()).toMatchObject({ source: 'codex', model: 'codex-gpt-image-2' })
+    } finally { stopAdapters(); if (previous === undefined) delete process.env.PYTHON_BIN; else process.env.PYTHON_BIN = previous }
+  })
+  test('keeps Codex models on Codex accounts while web models accept both account sources', () => {
+    const ready = { status: 'ready', quota: null, plan: 'prolite' }
+    expect(canRunSource({ ...ready, source: 'codex' }, 'web')).toBe(true)
+    expect(canRunSource({ ...ready, source: 'codex' }, 'codex')).toBe(true)
+    expect(canRunSource({ ...ready, source: 'web' }, 'web')).toBe(true)
+    expect(canRunSource({ ...ready, source: 'web' }, 'codex')).toBe(false)
+    expect(canRunSource({ ...ready, source: 'openai' }, 'web')).toBe(false)
+    expect(canRunSource({ ...ready, source: 'codex', plan: 'free' }, 'codex')).toBe(false)
+    expect(canRunSource({ ...ready, source: 'codex', plan: 'free' }, 'web')).toBe(true)
+    expect(canRunSource({ ...ready, source: 'web', status: 'limited', quota: 0 }, 'web')).toBe(false)
   })
   test('rejects untrusted image domains and private reference addresses', async () => {
     await expect(validateImageUrl('https://not-allowed.example/image.png')).rejects.toThrow('允许列表')
