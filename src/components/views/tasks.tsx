@@ -68,7 +68,8 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
   // Reopening the dialog moves off a model whose accounts are gone, so the default always has a usable account.
   useEffect(() => { if (!open) return; if (!anyReady) setDemo(true); if (!data.models.find(m => m.id === model)?.accounts) setModel(preferredModel(data.models)) }, [open, anyReady, data.models, model])
   const selected = data.models.find(m => m.id === model), source = selected?.source || 'codex', usable = selected?.accounts || 0
-  const ready = data.accounts.filter(a => a.source === source && a.status === 'ready')
+  // Web models also run on Codex accounts, over the web protocol and without using Codex image quota.
+  const ready = data.accounts.filter(a => (a.source === source || (source === 'web' && a.source === 'codex')) && a.status === 'ready')
   const free = ready.reduce((sum, a) => sum + Math.max(0, a.slots - a.inflight), 0)
   const refs = urls.split(/\s+/).filter(Boolean), tooMany = !demo && refs.length > 7
   async function submit(event: React.FormEvent) {
@@ -85,7 +86,7 @@ export function CreateTask({ open, onOpenChange, data, complete }: { open: boole
         <Textarea autoFocus placeholder="例如：一组极简护肤品广告摄影，柔和自然光，鼠尾草绿背景，保持产品风格统一…" rows={4} value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.currentTarget.form?.requestSubmit() } }} required maxLength={12000} />
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field label="生成模型" help={demo ? undefined : source === 'openai' ? usable ? `${usable} 把可用 OpenAI API Key` : '请先在账号池中添加或启用 OpenAI API Key' : usable ? `${usable} 个可用${source === 'codex' ? ' Codex ' : ' ChatGPT '}账号` : <span className="flex items-center gap-1 text-warn-ink"><TriangleAlert size={12} />没有可用的{source === 'codex' ? ' Codex ' : ' ChatGPT '}账号</span>}>
+        <Field label="生成模型" help={demo ? undefined : source === 'openai' ? usable ? `${usable} 把可用 OpenAI API Key` : '请先在账号池中添加或启用 OpenAI API Key' : usable ? `${usable} 个可用${source === 'codex' ? ' Codex ' : ' ChatGPT 网页或 Codex '}账号` : <span className="flex items-center gap-1 text-warn-ink"><TriangleAlert size={12} />没有可用的{source === 'codex' ? ' Codex ' : ' ChatGPT 网页或 Codex '}账号</span>}>
           <select className="select" value={model} onChange={e => setModel(e.target.value)}>{data.models.map(m => <option key={m.id} value={m.id}>{modelSourceLabel(m.source)} · {m.name}{m.accounts ? '' : m.source === 'openai' ? '（无可用 API Key）' : '（无可用账号）'}</option>)}</select>
         </Field>
         <Field label="图片数量"><select className="select" value={n} onChange={e => setN(Number(e.target.value))}>{[1, 2, 3, 4, 5, 6, 7].map(value => <option value={value} key={value}>{value} 张{value === 7 ? ' · 一组' : ''}</option>)}</select></Field>

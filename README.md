@@ -55,13 +55,15 @@ Compose 默认仅监听宿主机 `127.0.0.1:3080`，由服务器的 HTTPS 反向
 
 ## 第一次接入
 
-1. 在「账号池 → 添加账号 → 授权登录」获取设备码，打开 OpenAI 官方页面，登录并输入设备码。后台会自动换取凭证、加密保存并验证账号，无需复制 Token。此方式添加的是 Codex 来源账号；网页 Token 和已有 JSON 仍可在「手动导入」中添加。
+1. 在「账号池 → 添加账号 → 授权登录」获取设备码，打开 OpenAI 官方页面，登录并输入设备码。后台会自动换取凭证、加密保存并验证账号，无需复制 Token。此方式添加的是 Codex 来源账号，既可生成 Codex 来源的模型，也可生成网页来源的 `gpt-image-2`（走网页协议，不消耗 Codex 额度）；网页 Token 和已有 JSON 仍可在「手动导入」中添加。
 2. 在「服务设置」配置 OSS。保存后点击测试，实际验证一次写入、读取和删除。图片访问域名留空时使用私有签名 URL，查询任务时重新签名。
 3. 推荐客户端将图片直传 OSS，并添加允许读取的参考图域名。接口也接受 SDK 上传的图片文件。参考图最多 7 张、单图 10 MB，支持 PNG/JPEG/WebP；URL 仅接受允许域名的 HTTPS 地址，禁止重定向和私网目标。
 4. 在「API 密钥」创建业务密钥。完整密钥只显示一次，不要使用管理员密钥接入业务。
 5. 创建本地演示可查看队列流程。演示输出是固定 SVG，明确标记为演示，不调用 ChatGPT，也不测试 OSS。
 
 生图并发按账号限制：每个账号在「账号池」中设置并发上限（1～30，新账号默认 1），总容量等于所有可用账号的并发上限之和，单个任务的图片可以占用任意空闲名额。调度优先把图片分给负载率（处理中 ÷ 上限）最低的账号，负载相同时选最久未使用的账号。生图请求由常驻的 Python 进程池处理（默认 4 个接收新请求的进程，`ADAPTER_WORKERS` 可调），每个进程用线程同时等待多张图片。设置 `ADAPTER_POOL=0` 可回退为每张图片一个独立进程，用于对比或排查问题。队列容量默认 500 张。Web 额度在分配时预占，生成完成后扣减；Codex 的独立图片额度不能从网页额度接口推断，所以显示为「未获取」。
+
+模型来源决定使用的上游协议：`source: "web"` 走 ChatGPT 网页对话链路，`source: "codex"` 走 Codex Responses 链路，`source: "openai"` 走官方 Images API。网页来源的模型（`gpt-image-2`）也可以分配 Codex 授权账号：Codex 的 OAuth 凭证同样具备 chatgpt.com 后端权限，调度时按任务来源选择网页协议，因此不消耗 Codex 的图片额度。Codex 来源的模型仍然只分配给 Codex 账号，并照常使用 Codex 额度。
 
 参考图从 OSS 按块下载到暂存文件，以文件路径传给 Python。Codex 链路按块将参考图编码到请求临时文件，通过 curl 读取回调上传，避免等待上游时保留整份 Base64 和 JSON 请求体。上游响应也按块落到临时文件，随后逐个解析 SSE 事件，取得一张结果后释放重复事件；每个 Python 进程默认同时解析、解码最多 2 张结果图（`ADAPTER_IMAGE_PROCESSING`，1～32），其余请求继续等待，不持有完整结果图的内存副本。参考图下载和 OSS 结果上传共用最多 4 个传输名额（`IMAGE_TRANSFER_CONCURRENCY`，1～32）；上传直接读取结果文件。
 
@@ -100,7 +102,7 @@ curl https://your-service.example/v1/image-tasks \
 - 同步等待最多 180 秒。超时返回 HTTP 504 和 `task_id`；后台任务继续执行，应查询已有任务，勿直接重新提交。
 - `POST /v1/image-tasks/{id}/retry`：重试失败图片；已有暂存结果仅重传。已取消任务不可重试。
 - `POST /v1/image-tasks/{id}/cancel`：取消尚未开始的图片；正在生成的图片仍完成并保存。
-- `GET /v1/models`：默认返回 `gpt-image-2`（网页来源）、`codex-gpt-image-2`（Codex 来源，使用上游 `gpt-image-2`）、`gpt-image-2.5-sunburst`、`gpt-image-2.6-sunburst` 和 `gpt-image-2.6-flare`（后三者为 Codex 来源，原样传递模型名）。每个条目包含 `source`、`sizes`、`qualities`。管理员添加的 OpenAI API 映射使用自定义模型 ID 和 `source: "openai"`。`available` 仅表示账号池中有可用的对应来源账号或 API Key，不代表已逐一验证模型权限。
+- `GET /v1/models`：默认返回 `gpt-image-2`（网页来源）、`codex-gpt-image-2`（Codex 来源，使用上游 `gpt-image-2`）、`gpt-image-2.5-sunburst`、`gpt-image-2.6-sunburst` 和 `gpt-image-2.6-flare`（后三者为 Codex 来源，原样传递模型名）。每个条目包含 `source`、`sizes`、`qualities`。管理员添加的 OpenAI API 映射使用自定义模型 ID 和 `source: "openai"`。`available` 仅表示账号池中有可用的对应来源账号或 API Key，不代表已逐一验证模型权限；网页来源的可用性把 Codex 授权账号也计入。
 
 ### 配置生图模型
 

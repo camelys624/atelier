@@ -40,7 +40,7 @@ export function Keys({ data, add, action }: { data: Snapshot; add: () => void; a
           <td className="px-3.5 py-2.5">{item.accounts ? <span className="pill green"><span className="size-1.5 rounded-full bg-current" />{item.source === 'openai' ? `${item.accounts} 把可用 API Key` : `${item.accounts} 个可用账号`}</span> : <span className="pill amber"><span className="size-1.5 rounded-full bg-current" />{item.source === 'openai' ? '无可用 API Key' : '无可用账号'}</span>}</td>
         </tr>)}</tbody>
       </table></div>
-      {missingWeb && <p className="border-t px-3.5 py-2.5 text-xs leading-6 text-muted-foreground">「授权登录」添加的是 Codex 账号，可使用列表中所需账号为 Codex 的模型；ChatGPT 网页来源的模型需要在「添加账号 → 手动导入」中添加对应账号。</p>}
+      {missingWeb && <p className="border-t px-3.5 py-2.5 text-xs leading-6 text-muted-foreground">「授权登录」添加的 Codex 账号即可生成 ChatGPT 网页来源的模型，走网页协议且不消耗 Codex 生图额度；手动导入的网页账号同样可用。</p>}
     </section>
     <section className="panel overflow-hidden">
       <div className="panel-heading"><h2 className="panel-title">快速接入：提交任务，获取图片地址</h2><span className="pill">JSON API</span></div>

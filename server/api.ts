@@ -1,4 +1,4 @@
-import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Account, type Task, type Settings, type ImageRow } from './store'
+import { db, accounts, adminKey, equal, hash, id, seal, settings, publicSettings, saveSettings, publicAccount, getAccount, getTask, publicTask, taskImages, unseal, type Task, type Settings, type ImageRow } from './store'
 import { refreshAccount, safeError } from './adapter'
 import { submitTask, taskFingerprint, retryTask, pump, baseUrl } from './scheduler'
 import { imageUrl, imageBase64, testOss } from './storage'
@@ -8,7 +8,7 @@ import { deviceAuth, DeviceAuthError } from './device-auth'
 import { HttpError } from './http'
 import { accountSource, imageBody, prepareReferences, saveReferences, isUploadedReference, normalizeSize, normalizeQuality } from './image-input'
 import { modelConfiguration, imageModels, defaultImageModel, saveImageModel, saveResponsesModel, setDefaultImageModel, deleteImageModel } from './image-models'
-import { MAX_ACCOUNT_SLOTS, supportsCodexImages } from './account-policy'
+import { MAX_ACCOUNT_SLOTS, canRunSource, servesSource } from './account-policy'
 
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...headers } })
 const bad = (message: string): never => { throw new HttpError(400, message) }
@@ -40,10 +40,9 @@ function identity(request: Request): Identity {
   }
   throw new HttpError(401, '请登录或使用有效的 API 密钥')
 }
-const usableAccount = (a: Account) => ['ready', 'refreshing'].includes(a.status) && (a.quota === null || a.quota > 0) && (a.source !== 'codex' || supportsCodexImages(a.plan))
 function modelList(includeDisabled = false) {
-  const usable = accounts().filter(usableAccount), config = modelConfiguration()
-  return config.models.filter(model => includeDisabled || model.enabled).map(model => ({ ...model, isDefault: model.id === config.defaultModel, accounts: usable.filter(a => a.source === model.source).length }))
+  const config = modelConfiguration(), all = accounts()
+  return config.models.filter(model => includeDisabled || model.enabled).map(model => ({ ...model, isDefault: model.id === config.defaultModel, accounts: all.filter(a => canRunSource(a, model.source)).length }))
 }
 function checkOrigin(request: Request) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(request.method) || request.headers.has('authorization')) return
@@ -89,12 +88,12 @@ async function createTask(request: Request, input: any, who: Identity) {
   for (const reference of refs) if (!isUploadedReference(reference)) await validateImageUrl(reference)
   if (!demo) {
     const source = accountSource(model)
-    const pool = accounts().filter(a => a.source === source)
+    const pool = accounts().filter(a => servesSource(a, source))
     const others = modelList().filter(m => m.id !== model && m.accounts > 0).map(m => m.id)
     const hint = others.length ? `；当前可用的模型：${others.join('、')}` : ''
-    if (!pool.length) throw new HttpError(409, source === 'openai' ? '请先在账号池中添加 OpenAI API Key' : `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}来源账号，当前账号池没有此来源的账号${hint}`)
-    if (source === 'openai' && !pool.some(usableAccount)) throw new HttpError(409, '没有可用的 OpenAI API Key，请在账号池中启用或更新密钥')
-    if (!pool.some(usableAccount)) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型${hint}`)
+    if (!pool.length) throw new HttpError(409, source === 'openai' ? '请先在账号池中添加 OpenAI API Key' : `模型 ${model} 需要 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页或 Codex'}来源账号，当前账号池没有此来源的账号${hint}`)
+    if (source === 'openai' && !pool.some(a => canRunSource(a, source))) throw new HttpError(409, '没有可用的 OpenAI API Key，请在账号池中启用或更新密钥')
+    if (!pool.some(a => canRunSource(a, source))) throw new HttpError(409, `没有匹配的可用账号：请检查 ${source === 'codex' ? 'Codex' : 'ChatGPT 网页'}账号的验证状态、额度和会员类型${hint}`)
   }
   await saveReferences(uploads)
   const task = submitTask({ owner: who.owner, prompt, model, size, quality, n, refs, demo, clientId })

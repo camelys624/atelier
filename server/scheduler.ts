@@ -62,8 +62,10 @@ export function claimImage(): { image: ImageRow; task: Task; account: Account | 
       let account: Account | null = null
       if (!task.demo) {
         const source = task.source
+        // Web models accept Codex accounts too; dispatch then uses the web protocol, not Codex image quota.
+        const sources = source === 'web' ? ['web', 'codex'] : [source]
         // Least-loaded first (inflight relative to slots), then least recently used, so work spreads before any account stacks up.
-        account = db.query<Account, [string, number, ...string[]]>(`SELECT * FROM accounts WHERE source=? AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY CAST(inflight AS REAL)/slots,inflight,last_used,created LIMIT 1`).get(source, Date.now(), ...CODEX_IMAGE_PLANS)
+        account = db.query<Account, (string | number)[]>(`SELECT * FROM accounts WHERE source IN (${sources.map(() => '?').join(',')}) AND status='ready' AND inflight<slots AND (quota IS NULL OR quota>inflight) AND cooldown_until<=? AND (?!='codex' OR source!='codex' OR lower(trim(plan)) IN (${CODEX_IMAGE_PLANS.map(() => '?').join(',')})) ORDER BY CAST(inflight AS REAL)/slots,inflight,last_used,created LIMIT 1`).get(...sources, Date.now(), source, ...CODEX_IMAGE_PLANS)
         if (!account) continue
         db.run('UPDATE accounts SET inflight=inflight+1,last_used=? WHERE id=?', [Date.now(), account.id])
       }
@@ -104,7 +106,7 @@ async function execute(job: NonNullable<ReturnType<typeof claimImage>>) {
       await fetchReference(reference, path)
       refs.push(path)
     }
-    const request = { prompt: task.prompt, model: task.upstream_model || task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts }
+    const request = { prompt: task.prompt, model: task.upstream_model || task.model, size: task.size, quality: task.quality, images: refs, imageId: image.id, attempt: image.attempts, source: task.source }
     const result = task.demo ? await demoImage(image.id, image.position) : task.source === 'openai' ? await generateOpenAIImage(account!, { ...request, owner: task.owner }) : await generateImage(account!, request)
     db.transaction(() => {
       db.run("UPDATE images SET status='uploading',local_path=?,mime=?,bytes=? WHERE id=?", [result.path, result.mime, result.bytes, image.id])
